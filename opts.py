@@ -37,6 +37,11 @@ data = {
             'MOT20-07',
             'MOT20-08'
         ]
+    },
+    'CustomDemo': {
+        'test': [
+            'YT-01'
+        ]
     }
 }
 
