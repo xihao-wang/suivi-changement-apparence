@@ -12,6 +12,14 @@ from collections import defaultdict
 from sklearn.gaussian_process.kernels import RBF
 from sklearn.gaussian_process import GaussianProcessRegressor as GPR
 
+
+def _predict_1d(gpr, t):
+    pred = gpr.predict(t)
+    pred = np.asarray(pred)
+    if pred.ndim == 2:
+        return pred[:, 0]
+    return pred
+
 # 线性插值
 def LinearInterpolation(input_, interval):
     input_ = input_[np.lexsort([input_[:, 0], input_[:, 1]])]  # 按ID和帧排序
@@ -47,13 +55,13 @@ def GaussianSmooth(input_, tau):
         w = tracks[:, 4].reshape(-1, 1)
         h = tracks[:, 5].reshape(-1, 1)
         gpr.fit(t, x)
-        xx = gpr.predict(t)[:, 0]
+        xx = _predict_1d(gpr, t)
         gpr.fit(t, y)
-        yy = gpr.predict(t)[:, 0]
+        yy = _predict_1d(gpr, t)
         gpr.fit(t, w)
-        ww = gpr.predict(t)[:, 0]
+        ww = _predict_1d(gpr, t)
         gpr.fit(t, h)
-        hh = gpr.predict(t)[:, 0]
+        hh = _predict_1d(gpr, t)
         output_.extend([
             [t[i, 0], id_, xx[i], yy[i], ww[i], hh[i], 1, -1, -1 , -1] for i in range(len(t))
         ])

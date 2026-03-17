@@ -258,12 +258,24 @@ Because the custom data lives under `data/CustomDemo/...`, override the default 
 ```shell
 python strong_sort.py CustomDemo test --BoT --root_dataset data
 ```
+or,
+```shell
+python3 strong_sort.py CustomDemo test --BoT --root_dataset data --dir_save results/bot
+```
 
 This writes the tracking result to:
 
 ```text
-results/YT-02.txt
+results/YT-02.txt or results/bot/YT-02.txt
 ```
+
+Complete example
+```shell
+python3 strong_sort.py CustomDemo test --BoT --root_dataset data --dir_save results/bot
+python3 strong_sort.py CustomDemo test --BoT --EMA --root_dataset data --dir_save results/bot_ema
+python3 strong_sort.py CustomDemo test --BoT --NSA --EMA --MC --woC --root_dataset data --dir_save results/strongsort
+```
+
 
 Notes:
 
@@ -280,11 +292,44 @@ python tools/visualize_results.py \
   --fps 30
 ```
 
-Then play the video:
+Convert the video to h264 format
+```shell
+ffmpeg -i ./results/vis/YT-02_bot_ema.mp4 -c:v libx264 -pix_fmt yuv420p ./results/vis/YT-02_bot_ema_h264.mp4
+```
+
+Then play the video (can be played by mp4 player):
 
 ```shell
 ffplay ./results/vis/YT-02.mp4
 ```
+
+### 7. With one line command
+
+
+Put your own video into `downloads/`, and give a name for the sequence. 
+`--result_dir results/xxx`: result ficher folder,for example `--result_dir results/strong_gsi`
+`result_stem YT-xx_xxx`: generated video's name , for example `result_stem YT-03_strong_gsi`
+
+```shell
+python3 tools/run_custom_video_pipeline.py \
+  --video downloads/xxx.mp4 \
+  --seq YT-xx \
+  --result_dir results/xxx \
+  --vis_dir results/vis \
+  --result_stem YT-xx_xxxx \
+  --ema --nsa --mc --woc --gsi
+```
+also, if you want to skip some steps,
+
+```shell
+python3 ...
+  -- ...
+  -- ...
+  --skip_extract \
+  --skip_detect \
+  --skip_features
+```
+
 
 ### Summary
 
