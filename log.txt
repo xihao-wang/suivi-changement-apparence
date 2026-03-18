@@ -1,0 +1,3 @@
+0318_1121 : start to modify track.py, add short-term memory and long-term memory, but the logic is all simple. Short term servis only if longterm is not ready. Once the longterm memory > hits, the short term effect no more. 
+
+0318_1646 ： short term and longterm update together, longterm 30 frames and short term memory 5 frames. Short/long term update in each frame but longterm change gradually.

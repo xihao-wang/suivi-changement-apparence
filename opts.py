@@ -132,6 +132,10 @@ class opts:
         opt.min_confidence = 0.6
         opt.nms_max_overlap = 1.0
         opt.min_detection_height = 0
+        opt.short_memory_size = 5
+        opt.long_memory_size = 30
+        opt.memory_sim_threshold = 0.7
+        opt.beta = 0.8
         if opt.BoT:
             opt.max_cosine_distance = 0.4
             opt.dir_dets = 'data/StrongSORT_data/{}_{}_YOLOX+BoT'.format(opt.dataset, opt.mode)
