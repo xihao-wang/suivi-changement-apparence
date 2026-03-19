@@ -3,6 +3,7 @@ import numpy as np
 from deep_sort.kalman_filter import KalmanFilter
 from opts import opt
 
+
 class TrackState:
     """
     Enumeration type for the single target track state. Newly created tracks are
@@ -73,25 +74,10 @@ class Track:
         self.time_since_update = 0
 
         self.state = TrackState.Tentative
-
-        # The matcher still reads `self.features`, but now this list stores
-        # the memory-derived prototype instead of raw historical features.
         self.features = []
         if feature is not None:
             feature /= np.linalg.norm(feature)
-
-        # Memory-based identity representation.
-        self.short_memory = []
-        self.long_memory = []
-        self.prot_short = None
-        self.prot_long = None
-        self.prototype = None
-        if feature is not None:
-            self.short_memory.append(feature)
-            self.prot_short = feature.copy()
-            self.prot_long = None
-            self.prototype = feature.copy()
-            self.features = [self.prototype.copy()]
+            self.features.append(feature)
 
         self.scores = []
         if score is not None:
@@ -103,7 +89,6 @@ class Track:
         self.kf = KalmanFilter()
 
         self.mean, self.covariance = self.kf.initiate(detection)
-
 
     def to_tlwh(self):
         """Get current position in bounding box format `(top left x, top left y,
@@ -174,51 +159,22 @@ class Track:
             The associated detection.
 
         """
-        self.mean, self.covariance = self.kf.update(self.mean, self.covariance, detection.to_xyah(), detection.confidence)
+        self.mean, self.covariance = self.kf.update(
+            self.mean, self.covariance, detection.to_xyah(),
+            detection.confidence)
 
         feature = detection.feature / np.linalg.norm(detection.feature)
-
-        # Update short-term memory with the latest raw observation.
-        self.short_memory.append(feature)
-        if len(self.short_memory) > opt.short_memory_size:
-            self.short_memory.pop(0)
-
-        self.prot_short = np.mean(self.short_memory, axis=0)
-        self.prot_short /= np.linalg.norm(self.prot_short)
+        if opt.EMA:
+            smooth_feat = (
+                opt.EMA_alpha * self.features[-1] +
+                (1 - opt.EMA_alpha) * feature
+            )
+            smooth_feat /= np.linalg.norm(smooth_feat)
+            self.features = [smooth_feat]
+        else:
+            self.features.append(feature)
 
         self.hits += 1
-
-        # Start writing long-term memory later than track confirmation, and
-        # avoid writing every frame to reduce contamination during overlap.
-        if self.hits >= opt.memory_init_hits:
-            sim_long = np.dot(self.prot_long, feature) if self.prot_long is not None else 1.0
-            sim_short = np.dot(self.prot_short, feature) if self.prot_short is not None else 1.0
-
-            long_memory_write_gate = (
-                detection.confidence > opt.memory_min_confidence and
-                sim_long > opt.memory_sim_threshold and
-                sim_short > opt.short_memory_gate and
-                self.hits % opt.long_memory_stride == 0
-            )
-
-            if long_memory_write_gate:
-                self.long_memory.append(feature)
-                if len(self.long_memory) > opt.long_memory_size:
-                    self.long_memory.pop(0)
-
-        if len(self.long_memory) > 0:
-            self.prot_long = np.mean(self.long_memory, axis=0)
-            self.prot_long /= np.linalg.norm(self.prot_long)
-            sim_ls = np.dot(self.prot_long, feature)
-            beta = 0.8 if sim_ls > 0.8 else 0.6
-            self.prototype = beta * self.prot_long + (1 - beta) * self.prot_short
-        else:
-            self.prot_long = None
-            self.prototype = self.prot_short.copy()
-
-        self.prototype /= np.linalg.norm(self.prototype)
-        self.features = [self.prototype.copy()]
-
         self.time_since_update = 0
         if self.state == TrackState.Tentative and self.hits >= self._n_init:
             self.state = TrackState.Confirmed

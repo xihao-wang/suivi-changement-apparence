@@ -1,3 +1,11 @@
 0318_1121 : start to modify track.py, add short-term memory and long-term memory, but the logic is all simple. Short term servis only if longterm is not ready. Once the longterm memory > hits, the short term effect no more. 
 
-0318_1646 ： short term and longterm update together, longterm 30 frames and short term memory 5 frames. Short/long term update in each frame but longterm change gradually.
+0318_1646 ：short term and longterm update together, longterm 30 frames and short term memory 5 frames. Short/long term update in each frame but longterm change gradually.（n_hits = 3, stm = 5,ltm=30）
+
+0319_1120:  same as 0318_1646, but n_hits = 10，memory_sim_threshold :0.7 -> 0.8
+
+0319_1400:  use original bot, but n_hits = 10, no memory system
+
+0319_1530： compare with 0319_1120, add a memory init hits(separate the n_hits and memory_init_hits), delete the initialization of long_memory in __init__
+
+0319_1630:  compare with 0319_1530， add a detection confidence gate(filter noise )
