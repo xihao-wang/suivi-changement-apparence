@@ -12,3 +12,6 @@
 
 0320_1012:  compare with the previous versions , replace the original prototype-only matching with a memory-aware distance. The association cost is computed directly from short-term and long-term memory: d = 0.7 * d_short + 0.3 * d_long
 
+0320_1051:  same as 0320_1012 , but weight of short distance = 0.6 (original : 0.7 )
+
+0320_1507:  change the distance to k-top + average style (comparing with 0320_1051 : average style), we choose 3 as k, calculate the 3 top distance.
