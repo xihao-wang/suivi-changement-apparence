@@ -177,3 +177,20 @@ class NearestNeighborDistanceMetric(object):
         for i, target in enumerate(targets):
             cost_matrix[i, :] = self._metric(self.samples[target], features)
         return cost_matrix
+    
+    def _cosine_distance_to_memory(self, feature, memory_bank):
+        if len(memory_bank) == 0:
+            return 1.0
+        feature = np.asarray(feature, dtype=np.float32).reshape(1, -1)
+        memory_bank = np.asarray(memory_bank, dtype=np.float32)
+        distances = _cosine_distance(memory_bank, feature)
+        return float(distances.min())
+
+    def distance_with_memory(self, features, tracks):
+        cost_matrix = np.zeros((len(tracks), len(features)))
+        for i, track in enumerate(tracks):
+            for j, feature in enumerate(features):
+                d_short = self._cosine_distance_to_memory(feature, track.short_memory)
+                d_long = self._cosine_distance_to_memory(feature, track.long_memory)
+                cost_matrix[i, j] = 0.7 * d_short + 0.3 * d_long
+        return cost_matrix

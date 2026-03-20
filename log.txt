@@ -9,3 +9,6 @@
 0319_1530： compare with 0319_1120, add a memory init hits(separate the n_hits and memory_init_hits), delete the initialization of long_memory in __init__
 
 0319_1630:  compare with 0319_1530， add a detection confidence gate(filter noise )
+
+0320_1012:  compare with the previous versions , replace the original prototype-only matching with a memory-aware distance. The association cost is computed directly from short-term and long-term memory: d = 0.7 * d_short + 0.3 * d_long
+
