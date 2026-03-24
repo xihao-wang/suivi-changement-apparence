@@ -142,6 +142,10 @@ class opts:
         opt.short_distance_weight = 0.5
         opt.beta = 0.8
         opt.k = 3 # Number of top distances to consider for k-top cosine distance(in nn_matching.py, _cosine_distance_to_memory function)
+        opt.ambiguity_distance_threshold = 0.02
+        opt.ambiguity_margin = 0.003
+
+        
         if opt.BoT:
             opt.max_cosine_distance = 0.4
             opt.dir_dets = 'data/StrongSORT_data/{}_{}_YOLOX+BoT'.format(opt.dataset, opt.mode)

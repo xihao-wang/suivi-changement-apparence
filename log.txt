@@ -16,3 +16,13 @@
 
 0320_1507:  change the distance to k-top + average style (comparing with 0320_1051 : average style), we choose 3 as k, calculate the 3 top distance.
 
+0324_1503:  judge two tracks, if they are close,  we consider them as the ambiguous tracks , and let them use a process of transformation across successive frames to stabilize their identity decisions.
+
+0325 : delayed decision
+真正进入 delayed decision
+也就是：
+
+一旦某条 old track 进入 ambiguous split mode
+先不要让它立刻按普通方式匹配
+也不要让另一个 detection 立刻稳定生出新 ID
+这是最关键的一步。

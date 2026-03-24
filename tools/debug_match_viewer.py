@@ -39,6 +39,8 @@ class FrameReport:
     matches: list[dict[str, int]]
     unmatched_track_ids: list[int]
     unmatched_detection_indices: list[int]
+    ambiguous_track_ids: list[int]
+    ambiguous_info: dict[int, dict[str, Any]]
 
 
 def _format_bbox(tlwh) -> str:
@@ -140,6 +142,8 @@ def build_reports(
             ],
             unmatched_track_ids=[tracker.tracks[idx].track_id for idx in unmatched_tracks],
             unmatched_detection_indices=list(unmatched_detections),
+            ambiguous_track_ids=list(tracker.last_ambiguous_tracks),
+            ambiguous_info=dict(tracker.last_ambiguous_info),
         )
         reports.append(report)
 
@@ -240,6 +244,7 @@ class MatchViewerApp:
 
         self.summary_text = tk.Text(left, wrap="word", height=20, font=("TkDefaultFont", 21))
         self.summary_text.pack(fill="both", expand=True)
+        self.summary_text.tag_configure("alert", foreground="red")
 
         self.matrix_text = tk.Text(right, wrap="none", height=20, font=("TkFixedFont", 20))
         self.matrix_text.pack(fill="both", expand=True)
@@ -310,6 +315,16 @@ class MatchViewerApp:
                 color,
                 2,
             )
+            if tr["track_id"] in report.ambiguous_track_ids:
+                cv2.putText(
+                    image,
+                    f"T{tr['track_id']} AMBIGUOUS",
+                    (x, max(30, y - 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (255, 0, 0),
+                    2,
+                )
 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         max_w, max_h = 2400,1120
@@ -360,6 +375,24 @@ class MatchViewerApp:
             tk.END,
             f"Unmatched detections: {report.unmatched_detection_indices or 'none'}\n",
         )
+
+        if report.ambiguous_track_ids:
+            self.summary_text.insert(tk.END, "\nAmbiguous split warning\n", "alert")
+            for track_id in report.ambiguous_track_ids:
+                info = report.ambiguous_info.get(track_id, {})
+                candidates = info.get("candidates", [])
+                distances = info.get("distances", [])
+                if len(candidates) >= 2 and len(distances) >= 2:
+                    self.summary_text.insert(
+                        tk.END,
+                        f"  T{track_id}: D{candidates[0]} ({distances[0]:.4f}) vs "
+                        f"D{candidates[1]} ({distances[1]:.4f})\n",
+                        "alert",
+                    )
+                else:
+                    self.summary_text.insert(
+                        tk.END, f"  T{track_id}\n", "alert"
+                    )
 
         self.matrix_text.insert(tk.END, "Raw memory distance matrix(appearance)\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.raw_cost_matrix, report))

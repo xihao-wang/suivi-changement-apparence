@@ -43,6 +43,8 @@ class Tracker:
 
         self.tracks = []
         self._next_id = 1
+        self.last_ambiguous_tracks = []
+        self.last_ambiguous_info = {}
 
     def predict(self):
         """Propagate track state distributions one time step forward.
@@ -108,6 +110,43 @@ class Tracker:
             i for i, t in enumerate(self.tracks) if t.is_confirmed()]
         unconfirmed_tracks = [
             i for i, t in enumerate(self.tracks) if not t.is_confirmed()]
+
+        # Detect split ambiguity before the standard assignment step.
+        detection_indices = list(range(len(detections)))
+        ambiguous_tracks = []
+        ambiguous_info = {}
+        if confirmed_tracks and detection_indices:
+            cost_matrix = gated_metric(
+                self.tracks, detections, confirmed_tracks, detection_indices
+            )
+            big_cost = 1e5
+            for row_idx, track_idx in enumerate(confirmed_tracks):
+                row = cost_matrix[row_idx]
+                valid = []
+                for col_idx, dist in enumerate(row):
+                    if dist < big_cost:
+                        valid.append((detection_indices[col_idx], float(dist)))
+
+                if len(valid) < 2:
+                    continue
+
+                valid.sort(key=lambda x: x[1])
+                det_a, d1 = valid[0]
+                det_b, d2 = valid[1]
+
+                if (
+                    d1 < opt.ambiguity_distance_threshold
+                    and d2 < opt.ambiguity_distance_threshold
+                    and abs(d1 - d2) < opt.ambiguity_margin
+                ):
+                    ambiguous_tracks.append(self.tracks[track_idx].track_id)
+                    ambiguous_info[self.tracks[track_idx].track_id] = {
+                        "candidates": [det_a, det_b],
+                        "distances": [d1, d2],
+                    }
+
+        self.last_ambiguous_tracks = ambiguous_tracks
+        self.last_ambiguous_info = ambiguous_info
 
         # Associate confirmed tracks using appearance features.
         matches_a, unmatched_tracks_a, unmatched_detections = \
