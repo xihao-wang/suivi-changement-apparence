@@ -329,6 +329,12 @@ python3 ...
   --skip_detect \
   --skip_features
 ```
+### To run the debug interface
+```shell
+python3 tools/debug_match_viewer.py   \
+--sequence_dir data/CustomDemo/test/YT-03   \
+--detection_file data/StrongSORT_data/CustomDemo_test_YOLOX+BoT/YT-03.npy
+```
 
 
 ### Summary

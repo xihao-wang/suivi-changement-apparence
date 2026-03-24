@@ -15,3 +15,4 @@
 0320_1051:  same as 0320_1012 , but weight of short distance = 0.6 (original : 0.7 )
 
 0320_1507:  change the distance to k-top + average style (comparing with 0320_1051 : average style), we choose 3 as k, calculate the 3 top distance.
+
