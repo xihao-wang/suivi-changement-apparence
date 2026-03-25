@@ -188,6 +188,19 @@ class NearestNeighborDistanceMetric(object):
         k = min(opt.k, len(distances))
         topk = np.sort(distances)[:k]   # Get the k smallest distances
         return float(np.mean(topk))  # Return the average of the k smallest distances
+    
+    def _trend_consistency_cost(self, feature, track):
+        if track.prot_short is None or track.appearance_trend is None:
+            return 1.0
+        
+        delta = feature - track.prot_short
+        delta_norm = np.linalg.norm(delta)
+        if delta_norm < 1e-6:
+            return 0.0
+        delta /= delta_norm  # Normalize the trend vector
+        trend_sim = float(np.dot(delta, track.appearance_trend))
+
+        return 1.0-max(-1.0, min(1.0, trend_sim))  # Convert similarity to distance
 
     def distance_with_memory(self, features, tracks):
         cost_matrix = np.zeros((len(tracks), len(features)))
@@ -195,5 +208,11 @@ class NearestNeighborDistanceMetric(object):
             for j, feature in enumerate(features):
                 d_short = self._cosine_distance_to_memory(feature, track.short_memory)
                 d_long = self._cosine_distance_to_memory(feature, track.long_memory)
-                cost_matrix[i, j] = opt.short_distance_weight * d_short + (1 - opt.short_distance_weight) * d_long
+
+                appearance_cost = (opt.short_distance_weight * d_short + (1 - opt.short_distance_weight) * d_long)
+                trend_cost = self._trend_consistency_cost(feature, track)
+                cost_matrix[i, j] = (
+                    opt.appearance_cost_weight * appearance_cost
+                    + (1 - opt.appearance_cost_weight) * trend_cost
+                )
         return cost_matrix

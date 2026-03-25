@@ -18,4 +18,4 @@
 
 0324_1503:  judge two tracks, if they are close,  we consider them as the ambiguous tracks , and let them use a process of transformation across successive frames to stabilize their identity decisions.
 
-0325 : delayed decision
+0325_1537 : history as temporal evolution trend
