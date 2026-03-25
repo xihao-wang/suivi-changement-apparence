@@ -211,8 +211,37 @@ class NearestNeighborDistanceMetric(object):
 
                 appearance_cost = (opt.short_distance_weight * d_short + (1 - opt.short_distance_weight) * d_long)
                 trend_cost = self._trend_consistency_cost(feature, track)
+                trend_cost = trend_cost * opt.trend_scale  # Scale trend cost to balance with appearance cost
                 cost_matrix[i, j] = (
                     opt.appearance_cost_weight * appearance_cost
                     + (1 - opt.appearance_cost_weight) * trend_cost
                 )
         return cost_matrix
+
+    def distance_components_with_memory(self, features, tracks):
+        """Return appearance, trend, and final cost matrices for debugging."""
+        appearance_matrix = np.zeros((len(tracks), len(features)))
+        trend_matrix = np.zeros((len(tracks), len(features)))
+        final_matrix = np.zeros((len(tracks), len(features)))
+
+        for i, track in enumerate(tracks):
+            for j, feature in enumerate(features):
+                d_short = self._cosine_distance_to_memory(feature, track.short_memory)
+                d_long = self._cosine_distance_to_memory(feature, track.long_memory)
+
+                appearance_cost = (
+                    opt.short_distance_weight * d_short
+                    + (1 - opt.short_distance_weight) * d_long
+                )
+                trend_cost = self._trend_consistency_cost(feature, track)
+                trend_cost = trend_cost * opt.trend_scale
+                final_cost = (
+                    opt.appearance_cost_weight * appearance_cost
+                    + (1 - opt.appearance_cost_weight) * trend_cost
+                )
+
+                appearance_matrix[i, j] = appearance_cost
+                trend_matrix[i, j] = trend_cost
+                final_matrix[i, j] = final_cost
+
+        return appearance_matrix, trend_matrix, final_matrix

@@ -34,6 +34,9 @@ class FrameReport:
     image_path: str
     detections: list[dict[str, Any]]
     tracks: list[dict[str, Any]]
+    appearance_cost_matrix: list[list[float]]
+    trend_cost_matrix: list[list[float]]
+    final_cost_matrix: list[list[float]]
     raw_cost_matrix: list[list[float]]
     gated_cost_matrix: list[list[float]]
     matches: list[dict[str, int]]
@@ -96,7 +99,9 @@ def build_reports(
         features = np.array([detections[i].feature for i in detection_indices])
 
         if len(candidate_tracks) > 0 and len(detections) > 0:
-            raw_cost = tracker.metric.distance_with_memory(features, candidate_tracks)
+            appearance_cost, trend_cost, final_cost = \
+                tracker.metric.distance_components_with_memory(features, candidate_tracks)
+            raw_cost = final_cost
             gated_cost = linear_assignment.gate_cost_matrix(
                 raw_cost.copy(),
                 tracker.tracks,
@@ -105,6 +110,9 @@ def build_reports(
                 detection_indices,
             )
         else:
+            appearance_cost = np.zeros((len(candidate_tracks), len(detections)))
+            trend_cost = np.zeros((len(candidate_tracks), len(detections)))
+            final_cost = np.zeros((len(candidate_tracks), len(detections)))
             raw_cost = np.zeros((len(candidate_tracks), len(detections)))
             gated_cost = raw_cost.copy()
 
@@ -131,6 +139,9 @@ def build_reports(
                 }
                 for track in candidate_tracks
             ],
+            appearance_cost_matrix=appearance_cost.tolist(),
+            trend_cost_matrix=trend_cost.tolist(),
+            final_cost_matrix=final_cost.tolist(),
             raw_cost_matrix=raw_cost.tolist(),
             gated_cost_matrix=gated_cost.tolist(),
             matches=[
@@ -394,8 +405,12 @@ class MatchViewerApp:
                         tk.END, f"  T{track_id}\n", "alert"
                     )
 
-        self.matrix_text.insert(tk.END, "Raw memory distance matrix(appearance)\n")
-        self.matrix_text.insert(tk.END, self.format_matrix(report.raw_cost_matrix, report))
+        self.matrix_text.insert(tk.END, "Appearance cost matrix\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.appearance_cost_matrix, report))
+        self.matrix_text.insert(tk.END, "\nTrend cost matrix\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.trend_cost_matrix, report))
+        self.matrix_text.insert(tk.END, "\nFinal cost matrix(before gating)\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.final_cost_matrix, report))
         self.matrix_text.insert(tk.END, "\nGated distance matrix(motion / Kalman gating)\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.gated_cost_matrix, report))
 

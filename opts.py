@@ -144,7 +144,8 @@ class opts:
         opt.k = 3 # Number of top distances to consider for k-top cosine distance(in nn_matching.py, _cosine_distance_to_memory function)
         opt.ambiguity_distance_threshold = 0.02
         opt.ambiguity_margin = 0.003
-        opt.appearance_cost_weight = 0.8
+        opt.trend_scale = 0.01
+        opt.appearance_cost_weight = 0.7
 
         
         if opt.BoT:
