@@ -19,3 +19,27 @@
 0324_1503:  judge two tracks, if they are close,  we consider them as the ambiguous tracks , and let them use a process of transformation across successive frames to stabilize their identity decisions.
 
 0325_1537 : history as temporal evolution trend
+
+0326_0000 : 研究文章：2010 - Robust Object Tracking under Appearance Change Conditions. 可参考思想：把观测可靠性建模得更显式，而不只是用写/不写的阈值判断；需要区分当前观测中哪些是可信的、哪些可能是 outlier（如遮挡、局部污染、几何变化）。 
+/ Research paper: 2010 - Robust Object Tracking under Appearance Change Conditions. Reusable idea: model observation reliability more explicitly instead of only using a binary write/no-write threshold; 
+the update should distinguish reliable observations from possible outliers such as occlusion, partial contamination, or geometric variation.
+
+0327_0001 : 
+2015 - Object tracking via collaborative multi-task learning and appearance model updating. 
+
+technique 1 (Section 4.5.1, Eq. 12-13): window-based best-sample update (select the most reliable sample within a short temporal window instead of updating with the latest frame directly), which helps reduce drift caused by occlusion, blur, or unstable observations.
+technique 2 (Section 4.5.2): fixed part + variational part appearance model (keep a stable initial appearance reference together with an adaptive part), which helps adapt to new appearances while limiting long-term drift.
+technique 3 (Section 4.2; related setup in Section 4.1): local patch reliability for occlusion handling (use local regions instead of treating the whole box uniformly, and suppress patches with high reconstruction error), which helps avoid contaminating the global appearance feature under partial occlusion.
+technique 4 (Section 4.4 and Section 4.5.1): cross-model update / collaborative update (different appearance branches update and correct each other), which helps avoid error accumulation when relying on a single appearance branch in complex change scenarios.
+technique 5 (Section 4.5.1 and Section 4.5.2): online selective update instead of unconditional update (update the template or dictionary only when the observation is reliable, instead of updating at every step), which helps distinguish true appearance change from corrupted observations.
+
+
+0327_0002 :
+2016 - Beyond appearance model: Learning appearance variations for object tracking.
+
+technique 1 (Section 2.1; Section 3): appearance variation / reconstruction error prediction (predict the expected reconstruction error of the true target instead of simply choosing the candidate with the minimum reconstruction error), which helps handle cases where the most similar candidate to the old appearance model is not the true target.
+technique 2 (Section 3.1): surrounding-context-based appearance change modeling (extract features not only from the target itself but also from surrounding patches), which helps anticipate appearance variations caused by background changes, nearby motion, or upcoming occlusion.
+technique 3 (Section 3.1, part (1), Eq. 3): relative motion for potential occlusion estimation (use the relative motion between surrounding blocks and the target center to infer which regions may move toward the target), which helps model possible occlusion before the target appearance is heavily corrupted.
+technique 4 (Section 3.1, part (2)): appearance feature from local blocks (represent each local block with appearance template statistics and reconstruction error information), which helps describe the current local visual state of the target and its surrounding regions.
+technique 5 (Section 3.1, part (3)): difference of appearance feature (use temporal differences of appearance templates and reconstruction errors between consecutive frames as features), which helps explicitly model how the appearance is changing rather than only what it looks like at the current frame.
+technique 6 (Section 3.2; Section 4.1; Conclusion): offline + online adaptation for appearance variation prediction (pretrain the predictor on external videos and then update it online during tracking), which helps combine generic prior knowledge with video-specific adaptation.
