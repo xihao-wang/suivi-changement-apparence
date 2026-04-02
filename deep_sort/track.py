@@ -88,11 +88,14 @@ class Track:
         self.prototype = None
         self.appearance_trend = None
         if feature is not None:
-            self.short_memory.append(feature)
-            self.prot_short = feature.copy()
-            self.prot_long = None
-            self.prototype = feature.copy()
-            self.features = [self.prototype.copy()]
+            if opt.enable_stm_ltm:
+                self.short_memory.append(feature)
+                self.prot_short = feature.copy()
+                self.prot_long = None
+                self.prototype = feature.copy()
+                self.features = [self.prototype.copy()]
+            else:
+                self.features = [feature.copy()]
 
         self.scores = []
         if score is not None:
@@ -179,6 +182,14 @@ class Track:
 
         feature = detection.feature / np.linalg.norm(detection.feature)
 
+        if not opt.enable_stm_ltm:
+            self.features = [feature.copy()]
+            self.hits += 1
+            self.time_since_update = 0
+            if self.state == TrackState.Tentative and self.hits >= self._n_init:
+                self.state = TrackState.Confirmed
+            return
+
         # Update short-term memory with the latest raw observation.
         self.short_memory.append(feature)
         if len(self.short_memory) > opt.short_memory_size:
@@ -187,8 +198,8 @@ class Track:
         self.prot_short = np.mean(self.short_memory, axis=0)
         self.prot_short /= np.linalg.norm(self.prot_short)
 
-        # estimate appearance trend for ambiguity resolution
-        if len(self.short_memory) >= 2:
+        # estimate appearance trend from recent appearance evolution
+        if opt.enable_trend and len(self.short_memory) >= 2:
             diffs = []
             for i in range(1, len(self.short_memory)):
                 diffs.append(self.short_memory[i] - self.short_memory[i-1])
@@ -205,21 +216,26 @@ class Track:
 
         # Start writing long-term memory later than track confirmation, and
         # avoid writing every frame to reduce contamination during overlap.
-        if self.hits >= opt.memory_init_hits:
-            sim_long = np.dot(self.prot_long, feature) if self.prot_long is not None else 1.0
-            sim_short = np.dot(self.prot_short, feature) if self.prot_short is not None else 1.0
+        if opt.enable_memory_init_control:
+            if self.hits >= opt.memory_init_hits:
+                sim_long = np.dot(self.prot_long, feature) if self.prot_long is not None else 1.0
+                sim_short = np.dot(self.prot_short, feature) if self.prot_short is not None else 1.0
 
-            long_memory_write_gate = (
-                detection.confidence > opt.memory_min_confidence and
-                sim_long > opt.memory_sim_threshold and
-                sim_short > opt.short_memory_gate and
-                self.hits % opt.long_memory_stride == 0
-            )
+                long_memory_write_gate = (
+                    detection.confidence > opt.memory_min_confidence and
+                    sim_long > opt.memory_sim_threshold and
+                    sim_short > opt.short_memory_gate and
+                    self.hits % opt.long_memory_stride == 0
+                )
 
-            if long_memory_write_gate:
-                self.long_memory.append(feature)
-                if len(self.long_memory) > opt.long_memory_size:
-                    self.long_memory.pop(0)
+                if long_memory_write_gate:
+                    self.long_memory.append(feature)
+                    if len(self.long_memory) > opt.long_memory_size:
+                        self.long_memory.pop(0)
+        else:
+            self.long_memory.append(feature)
+            if len(self.long_memory) > opt.long_memory_size:
+                self.long_memory.pop(0)
 
         if len(self.long_memory) > 0:
             self.prot_long = np.mean(self.long_memory, axis=0)

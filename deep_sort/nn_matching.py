@@ -183,13 +183,16 @@ class NearestNeighborDistanceMetric(object):
             return 1.0
         feature = np.asarray(feature, dtype=np.float32).reshape(1, -1)
         memory_bank = np.asarray(memory_bank, dtype=np.float32)
-        # change to k-top cosine distance
         distances = _cosine_distance(memory_bank, feature).reshape(-1)
-        k = min(opt.k, len(distances))
-        topk = np.sort(distances)[:k]   # Get the k smallest distances
-        return float(np.mean(topk))  # Return the average of the k smallest distances
-    
+        if opt.enable_topk_matching:
+            k = min(opt.k, len(distances))
+            topk = np.sort(distances)[:k]
+            return float(np.mean(topk))
+        return float(np.min(distances))
+
     def _trend_consistency_cost(self, feature, track):
+        if not opt.enable_trend:
+            return 0.0
         if track.prot_short is None or track.appearance_trend is None:
             return 1.0
         
@@ -211,7 +214,7 @@ class NearestNeighborDistanceMetric(object):
 
                 appearance_cost = (opt.short_distance_weight * d_short + (1 - opt.short_distance_weight) * d_long)
                 trend_cost = self._trend_consistency_cost(feature, track)
-                trend_cost = trend_cost * opt.trend_scale  # Scale trend cost to balance with appearance cost
+                trend_cost = trend_cost * opt.trend_scale
                 cost_matrix[i, j] = (
                     opt.appearance_cost_weight * appearance_cost
                     + (1 - opt.appearance_cost_weight) * trend_cost

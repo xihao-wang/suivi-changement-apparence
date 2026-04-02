@@ -97,8 +97,12 @@ class Tracker:
 
         def gated_metric(tracks, dets, track_indices, detection_indices):
             features = np.array([dets[i].feature for i in detection_indices])
-            candidate_tracks = [tracks[i] for i in track_indices]
-            cost_matrix = self.metric.distance_with_memory(features, candidate_tracks)
+            if opt.enable_memory_matching:
+                candidate_tracks = [tracks[i] for i in track_indices]
+                cost_matrix = self.metric.distance_with_memory(features, candidate_tracks)
+            else:
+                targets = np.array([tracks[i].track_id for i in track_indices])
+                cost_matrix = self.metric.distance(features, targets)
             cost_matrix = linear_assignment.gate_cost_matrix(
                 cost_matrix, tracks, dets, track_indices,
                 detection_indices)

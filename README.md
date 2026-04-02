@@ -1,350 +1,321 @@
 # suivi-changement-apparence
-## Data&Model Preparation
 
-1. Download MOT17 & MOT20 from the [official website](https://motchallenge.net/).
+StrongSORT-based tracking project for **appearance change** analysis on custom videos.
 
-   ```
-   data/MOTChallenge
-   ├── MOT17
-   	│   ├── test
-   	│   └── train
-   └── MOT20
-       ├── test
-       └── train
-   ```
-
-2. Download our prepared [data](https://drive.google.com/drive/folders/1Zk6TaSJPbpnqbz1w4kfhkKFCEzQbjfp_?usp=sharing) in Google disk (or [baidu disk](https://pan.baidu.com/s/1EtBbo-12xhjsqW5x-dYX8A?pwd=sort) with code "sort")
-
-   ```
-   path_to_dataspace
-   ├── AFLink_epoch20.pth  # checkpoints for AFLink model
-   ├── MOT17_ECC_test.json  # CMC model
-   ├── MOT17_ECC_val.json  # CMC model
-   ├── MOT17_test_YOLOX+BoT  # detections + features
-   ├── MOT17_test_YOLOX+simpleCNN  # detections + features
-   ├── MOT17_trainval_GT_for_AFLink  # GT to train and eval AFLink model
-   ├── MOT17_val_GT_for_TrackEval  # GT to eval the tracking results.
-   ├── MOT17_val_YOLOX+BoT  # detections + features
-   ├── MOT17_val_YOLOX+simpleCNN  # detections + features
-   ├── MOT20_ECC_test.json  # CMC model
-   ├── MOT20_test_YOLOX+BoT  # detections + features
-   ├── MOT20_test_YOLOX+simpleCNN  # detections + features
-   ```
-
-3. Set the paths of your dataset and other files in "opts.py", i.e., root_dataset, path_AFLink, dir_save, dir_dets, path_ECC. 
-
-Note: If you want to generate ECC results, detections and features by yourself, please refer to the [Auxiliary tutorial](https://github.com/dyhBUPT/StrongSORT/blob/master/others/AuxiliaryTutorial.md).
-
-## Requirements
-
-- pytorch
-- opencv
-- scipy
-- sklearn
-
-For example, we have tested the following commands to create an environment for StrongSORT:
-
-```shell
-conda create -n strongsort python=3.8 -y
-conda activate strongsort
-pip3 install torch torchvision torchaudio
-pip install opencv-python
-pip install scipy
-pip install scikit-learn
-```
-
-once the environment is properly configured, we can use directly
-```shell
-conda activate strongsort
-```
-
-## Tracking
-
-- **Run DeepSORT on MOT17-val**
-
-  ```shell
-  python strong_sort.py MOT17 val
-  ```
-
-- **Run StrongSORT on MOT17-val**
-
-  ```shell
-  python strong_sort.py MOT17 val --BoT --ECC --NSA --EMA --MC --woC
-  ```
-
-- **Run StrongSORT++ on MOT17-val**
-
-  ```shell
-  python strong_sort.py MOT17 val --BoT --ECC --NSA --EMA --MC --woC --AFLink --GSI
-  ```
-
-- **Run StrongSORT++ on MOT17-test**
-
-  ```shell
-  python strong_sort.py MOT17 test --BoT --ECC --NSA --EMA --MC --woC --AFLink --GSI
-  ```
-
-- **Run StrongSORT++ on MOT20-test**
-
-  ```shell
-  python strong_sort.py MOT20 test --BoT --ECC --NSA --EMA --MC --woC --AFLink --GSI
-  ```
-
-## Visualization
-For enregister the video, enter
-
-```shell
-python tools/visualize_results.py \
---sequence_dir ./data/MOTChallenge/MOT17/train/MOT17-02-FRCNN \
---result_txt ./results/MOT17-02-FRCNN.txt \
---out_video ./results/vis/MOT17-02-FRCNN.mp4 --fps 25
-```
-For watching:
-```shell
-ffplay results/vis/MOT17-XX-FRCNN.mp4
-```
-
-## Run On A Custom Video
-
-This repository can also be used on a single custom video, but the full pipeline is offline:
+This repository is mainly used in an **offline pipeline**:
 
 ```text
-video -> frames (img1) -> detections (.txt) -> detections + features (.npy) -> StrongSORT -> result .txt -> visualization
+video -> frames (img1) -> detections (.txt) -> detections + features (.npy) -> tracking (.txt) -> visualization (.mp4)
 ```
 
-The steps below summarize the workflow that has been tested in this project.
+The codebase contains:
+- a custom video pipeline,
+- several appearance-memory modifications on top of StrongSORT,
+- ablation switches to test each added technique separately,
+- debug tools to inspect per-frame matching.
 
-### 1. Prepare a MOT-style sequence
+---
 
-Assume the input video is `downloads/222.mp4` and the new sequence name is `YT-02`.
+## 1. What This Project Uses
 
-Create the sequence folder:
+For the current project, the important blocks are:
 
-```shell
-mkdir -p data/CustomDemo/test/YT-02/img1
+- **ByteTrack**: person detections
+- **FastReID / BoT**: appearance features
+- **DeepSORT / StrongSORT core**: ID association
+- **Our modifications**:
+  - STM + LTM
+  - delayed long-memory initialization
+  - memory-aware matching
+  - top-k matching
+  - appearance trend
+
+---
+
+## 2. Minimal Environment
+
+Recommended environments:
+
+- `strongsort` for tracking / visualization
+- `fastreid` for feature extraction
+- `bytetrack-gpu` for detection
+
+Minimal Python packages for the tracking part:
+
+```bash
+conda create -n strongsort python=3.8 -y
+conda activate strongsort
+pip install torch torchvision torchaudio
+pip install opencv-python scipy scikit-learn
 ```
 
-Extract frames:
+If you only want to run tracking from an existing `.npy`, only the `strongsort` environment is needed.
 
-```shell
-ffmpeg -i downloads/222.mp4 data/CustomDemo/test/YT-02/img1/%06d.jpg
+---
+
+## 3. Expected Input Format
+
+### Sequence folder
+
+Each custom sequence should follow the MOT-style layout:
+
+```text
+data/CustomDemo/test/<SEQ>/
+├── img1/
+│   ├── 000001.jpg
+│   ├── 000002.jpg
+│   └── ...
+└── seqinfo.ini
 ```
 
-Count frames:
-
-```shell
-find data/CustomDemo/test/YT-02/img1 -type f | wc -l
-```
-
-Inspect the video metadata:
-
-```shell
-ffprobe downloads/222.mp4
-```
-
-Create `data/CustomDemo/test/YT-02/seqinfo.ini` using the frame count and resolution reported above:
+Example `seqinfo.ini`:
 
 ```ini
 [Sequence]
-name=YT-02
+name=YT-03
 imDir=img1
 frameRate=30
-seqLength=1421
+seqLength=2169
 imWidth=1148
 imHeight=2038
 imExt=.jpg
 ```
 
-### 2. Generate detections with ByteTrack
+### Detection + feature file
 
-This project expects MOT-style detections before StrongSORT runs. We used ByteTrack for this step.
-
-Requirements:
-
-- a local ByteTrack clone
-- a ByteTrack checkpoint such as `pretrained/bytetrack_x_mot17.pth.tar`
-
-Next, switch to the `ByteTrack` repository and run detection on the custom video:
-
-```shell
-cd <ByteTrack_ROOT>
-PYTHONPATH=$(pwd) python3 tools/demo_track.py video \
-  -f exps/example/mot/yolox_x_mix_det.py \
-  -c pretrained/bytetrack_x_mot17.pth.tar \
-  --path <VIDEO_PATH> \
-  --device cpu \
-  --save_result
-```
-
-Note:
-
-- In this setup, `tools/demo_track.py` was modified to save a second file named `*_det.txt`.
-- This file contains MOT-style detections:
-  `frame,-1,x,y,w,h,score,-1,-1,-1`
-
-Copy the generated detection file to a stable location:
-
-```shell
-cd <THIS_REPO_ROOT>
-mkdir -p data/detections
-cp <ByteTrack_ROOT>/YOLOX_outputs/yolox_x_mix_det/track_vis/<timestamp>_det.txt \
-   data/detections/YT-02.txt
-```
-
-### 3. Extract FastReID features and build the `.npy`
-
-StrongSORT does not read the detection `.txt` directly. It expects a `.npy` file containing:
+StrongSORT does **not** read the raw detection `.txt` directly.  
+It reads a `.npy` file containing:
 
 - MOT detection columns
-- appearance features for each box
+- one appearance feature per detection
 
-This repository includes a helper script:
-
-```shell
-tools/extract_fastreid_features.py
-```
-
-Requirements:
-
-- a local FastReID clone
-- a FastReID config, e.g. `configs/DukeMTMC/bagtricks_S50.yml`
-- matching weights, e.g. `weights/duke_bot_S50.pth`
-
-Next, switch back to this repository, activate the `fastreid` environment, and run feature extraction:
-
-```shell
-conda activate fastreid
-cd <THIS_REPO_ROOT>
-
-python tools/extract_fastreid_features.py \
-  --fastreid_root <FastReID_ROOT> \
-  --config_file <FastReID_ROOT>/configs/DukeMTMC/bagtricks_S50.yml \
-  --weights <FastReID_ROOT>/weights/duke_bot_S50.pth \
-  --sequence_dir data/CustomDemo/test/YT-02 \
-  --detections_txt data/detections/YT-02.txt \
-  --output_npy data/StrongSORT_data/CustomDemo_test_YOLOX+BoT/YT-02.npy \
-  --device cpu
-```
-
-If a CUDA-enabled FastReID environment is available, `--device cuda` can be used instead.
-
-### 4. Register the custom sequence in `opts.py`
-
-Add the custom dataset and sequence to `opts.py`:
-
-```python
-'CustomDemo': {
-    'test': [
-        'YT-02'
-    ]
-}
-```
-
-When testing several custom videos, add them all to the same list:
-
-```python
-'CustomDemo': {
-    'test': [
-        'YT-01',
-        'YT-02'
-    ]
-}
-```
-
-### 5. Run StrongSORT on the custom sequence
-
-Because the custom data lives under `data/CustomDemo/...`, override the default dataset root:
-
-```shell
-python strong_sort.py CustomDemo test --BoT --root_dataset data
-```
-or,
-```shell
-python3 strong_sort.py CustomDemo test --BoT --root_dataset data --dir_save results/bot
-```
-
-This writes the tracking result to:
+Example:
 
 ```text
-results/YT-02.txt or results/bot/YT-02.txt
+data/StrongSORT_data/CustomDemo_test_YOLOX+BoT/YT-03.npy
 ```
 
-Complete example
-```shell
-python3 strong_sort.py CustomDemo test --BoT --root_dataset data --dir_save results/bot
-python3 strong_sort.py CustomDemo test --BoT --EMA --root_dataset data --dir_save results/bot_ema
-python3 strong_sort.py CustomDemo test --BoT --NSA --EMA --MC --woC --root_dataset data --dir_save results/strongsort
-```
+---
 
+## 4. Recommended Workflow
 
-Notes:
+### Option A: one-line custom pipeline
 
-- Do not use `--ECC` unless you have generated the corresponding `CustomDemo_ECC_test.json`.
-- Do not use `val` unless you have explicitly prepared the custom sequence under a validation split.
+This is the easiest entry point when starting from a raw video:
 
-### 6. Visualize the final tracking result
-
-```shell
-python tools/visualize_results.py \
-  --sequence_dir ./data/CustomDemo/test/YT-02 \
-  --result_txt ./results/YT-02.txt \
-  --out_video ./results/vis/YT-02.mp4 \
-  --fps 30
-```
-
-Convert the video to h264 format
-```shell
-ffmpeg -i ./results/vis/YT-02_bot_ema.mp4 -c:v libx264 -pix_fmt yuv420p ./results/vis/YT-02_bot_ema_h264.mp4
-```
-
-Then play the video (can be played by mp4 player):
-
-```shell
-ffplay ./results/vis/YT-02.mp4
-```
-
-### 7. With one line command
-
-
-Put your own video into `downloads/`, and give a name for the sequence. 
-`--result_dir results/xxx`: result ficher folder,for example `--result_dir results/strong_gsi`
-`result_stem YT-xx_xxx`: generated video's name , for example `result_stem YT-03_strong_gsi`
-
-```shell
+```bash
 python3 tools/run_custom_video_pipeline.py \
-  --video downloads/xxx.mp4 \
-  --seq YT-xx \
-  --result_dir results/xxx \
+  --video downloads/333.mp4 \
+  --seq YT-03 \
+  --result_dir results/ours \
   --vis_dir results/vis \
-  --result_stem YT-xx_xxxx \
-  --ema --nsa --mc --woc --gsi
+  --result_stem YT-03_run
 ```
-also, if you want to skip some steps,
 
-```shell
-python3 ...
-  -- ...
-  -- ...
+Useful flags:
+
+- `--skip_extract`: skip frame extraction
+- `--skip_detect`: skip ByteTrack detection
+- `--skip_features`: skip FastReID feature extraction
+- `--skip_track`: skip StrongSORT tracking
+- `--skip_vis`: skip video rendering
+
+Example when frames, detections and features are already prepared:
+
+```bash
+python3 tools/run_custom_video_pipeline.py \
+  --video downloads/333.mp4 \
+  --seq YT-03 \
+  --result_dir results/ours \
+  --vis_dir results/vis \
+  --result_stem YT-03_run \
   --skip_extract \
   --skip_detect \
   --skip_features
 ```
-### To run the debug interface
-```shell
-python3 tools/debug_match_viewer.py   \
---sequence_dir data/CustomDemo/test/YT-03   \
---detection_file data/StrongSORT_data/CustomDemo_test_YOLOX+BoT/YT-03.npy
+
+### Option B: tracking only from an existing `.npy`
+
+If the sequence folder and `.npy` already exist, run StrongSORT directly:
+
+```bash
+python3 strong_sort.py CustomDemo test --BoT --root_dataset data --dir_save results/ours
 ```
 
+This is the preferred entry point for:
 
-### Summary
+- repeated experiments,
+- ablation studies,
+- debugging the tracking logic only.
 
-For each new custom video, the minimum repeatable workflow is:
+---
 
-1. Extract frames into `data/CustomDemo/test/<SEQ>/img1`
-2. Create `seqinfo.ini`
-3. Run ByteTrack and save `<SEQ>.txt` detections
-4. Run `tools/extract_fastreid_features.py` to build `<SEQ>.npy`
-5. Add `<SEQ>` in `opts.py`
-6. Run `python strong_sort.py CustomDemo test --BoT --root_dataset data`
-7. Visualize `results/<SEQ>.txt`
+## 5. Manual Workflow
+
+Use this only if you want to run each stage manually.
+
+### Step 1: extract frames
+
+```bash
+mkdir -p data/CustomDemo/test/YT-03/img1
+ffmpeg -i downloads/333.mp4 data/CustomDemo/test/YT-03/img1/%06d.jpg
+```
+
+### Step 2: generate detections with ByteTrack
+
+Run ByteTrack in your local ByteTrack repository and save the MOT-style detection file.
+
+Expected output example:
+
+```text
+data/detections/YT-03.txt
+```
+
+### Step 3: extract ReID features and build `.npy`
+
+```bash
+python tools/extract_fastreid_features.py \
+  --fastreid_root <FastReID_ROOT> \
+  --config_file <FastReID_CONFIG> \
+  --weights <FastReID_WEIGHTS> \
+  --sequence_dir data/CustomDemo/test/YT-03 \
+  --detections_txt data/detections/YT-03.txt \
+  --output_npy data/StrongSORT_data/CustomDemo_test_YOLOX+BoT/YT-03.npy \
+  --device cuda
+```
+
+### Step 4: run tracking
+
+```bash
+python3 strong_sort.py CustomDemo test --BoT --root_dataset data --dir_save results/ours
+```
+
+### Step 5: render the tracking result
+
+```bash
+python3 tools/visualize_results.py \
+  --sequence_dir data/CustomDemo/test/YT-03 \
+  --result_txt results/ours/YT-03.txt \
+  --out_video results/vis/YT-03.mp4 \
+  --fps 30
+```
+
+---
+
+## 6. Ablation Cases
+
+The project supports explicit ablation cases through:
+
+```bash
+--ablation_case
+```
+
+Available cases:
+
+1. `1_bot`  
+   BoT only
+
+2. `2_stm_ltm`  
+   BoT + STM + LTM
+
+3. `3_stm_ltm_memory_init`  
+   BoT + STM + LTM + delayed long-memory initialization
+
+4. `4_stm_ltm_memory_aware`  
+   BoT + STM + LTM + memory-aware matching
+
+5. `5_stm_ltm_memory_aware_topk`  
+   BoT + STM + LTM + memory-aware matching + top-k
+
+6. `6_stm_ltm_memory_aware_trend`  
+   BoT + STM + LTM + memory-aware matching + appearance trend
+
+7. `7_stm_ltm_memory_init_memory_aware`  
+   BoT + STM + LTM + memory init control + memory-aware matching
+
+8. `8_stm_ltm_memory_init_memory_aware_topk`  
+   BoT + STM + LTM + memory init control + memory-aware matching + top-k
+
+9. `9_full`  
+   BoT + STM + LTM + memory init control + memory-aware matching + top-k + trend
+
+Example:
+
+```bash
+python3 strong_sort.py CustomDemo test \
+  --BoT \
+  --ablation_case 8_stm_ltm_memory_init_memory_aware_topk \
+  --root_dataset data \
+  --dir_save results/ablation_8
+```
+
+Recommended baselines:
+
+- external baseline: `1_bot`
+- internal baseline: `2_stm_ltm`
+
+---
+
+## 7. Debug Tools
+
+### Interactive matching viewer
+
+Use the viewer to inspect:
+
+- detections,
+- tracks,
+- matches / unmatched elements,
+- appearance cost,
+- trend cost,
+- final cost,
+- gated cost,
+- ambiguity warnings.
+
+```bash
+python3 tools/debug_match_viewer.py \
+  --sequence_dir data/CustomDemo/test/YT-03 \
+  --detection_file data/StrongSORT_data/CustomDemo_test_YOLOX+BoT/YT-03.npy
+```
+
+### Keyboard shortcuts
+
+- `a`: previous frame
+- `d`: next frame
+
+---
+
+## 8. Output Files
+
+Typical outputs:
+
+```text
+results/ours/YT-03_run.txt
+results/vis/YT-03_run.mp4
+```
+
+The result `.txt` follows MOT format:
+
+```text
+frame,id,x,y,w,h,1,-1,-1,-1
+```
+
+---
+
+## 9. Practical Notes
+
+- For custom videos, use `CustomDemo test` and `--root_dataset data`.
+- Do not enable `--ECC` unless the corresponding ECC json exists.
+- If you already have the `.npy`, avoid rerunning detection and feature extraction.
+- For ablation studies, prefer `strong_sort.py` over the full pipeline script.
+
+---
+
+## 10. Original StrongSORT Context
+
+This repository started from StrongSORT, but the current work focuses mainly on:
+
+- BoT appearance features,
+- DeepSORT-style association,
+- memory-based modifications for appearance change.
+
+If you need the original benchmark-oriented StrongSORT usage on MOT17 / MOT20, refer to the upstream StrongSORT documentation.

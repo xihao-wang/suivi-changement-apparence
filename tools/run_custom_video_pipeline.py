@@ -59,6 +59,22 @@ def parse_args():
 
     parser.add_argument("--result_stem", default=None, help="Base filename for result txt and visualization")
     parser.add_argument("--fps", type=int, default=None, help="Override fps written to seqinfo.ini and visualization")
+    parser.add_argument(
+        "--ablation_case",
+        default="9_full",
+        choices=[
+            "1_bot",
+            "2_stm_ltm",
+            "3_stm_ltm_memory_init",
+            "4_stm_ltm_memory_aware",
+            "5_stm_ltm_memory_aware_topk",
+            "6_stm_ltm_memory_aware_trend",
+            "7_stm_ltm_memory_init_memory_aware",
+            "8_stm_ltm_memory_init_memory_aware_topk",
+            "9_full",
+        ],
+        help="Appearance-change ablation case passed to StrongSORT.",
+    )
 
     parser.add_argument("--ema", action="store_true", help="Enable EMA")
     parser.add_argument("--nsa", action="store_true", help="Enable NSA")
@@ -138,7 +154,13 @@ def run_strongsort(args, sequence_dir, detection_npy, result_txt):
         if repo_root_str not in sys.path:
             sys.path.insert(0, repo_root_str)
             added_repo_root = True
-        sys.argv = ["strongsort_pipeline", args.dataset, args.split]
+        sys.argv = [
+            "strongsort_pipeline",
+            args.dataset,
+            args.split,
+            "--ablation_case",
+            args.ablation_case,
+        ]
         import opts as opts_module
         from deep_sort_app import run as strongsort_run
 

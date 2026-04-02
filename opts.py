@@ -123,6 +123,23 @@ class opts:
             type=float,
             default=0.98
         )
+        self.parser.add_argument(
+            '--ablation_case',
+            type=str,
+            default='9_full',
+            choices=[
+                '1_bot',
+                '2_stm_ltm',
+                '3_stm_ltm_memory_init',
+                '4_stm_ltm_memory_aware',
+                '5_stm_ltm_memory_aware_topk',
+                '6_stm_ltm_memory_aware_trend',
+                '7_stm_ltm_memory_init_memory_aware',
+                '8_stm_ltm_memory_init_memory_aware_topk',
+                '9_full',
+            ],
+            help='Explicit ablation case for the appearance-change modules.'
+        )
 
     def parse(self, args=''):
         if args == '':
@@ -146,6 +163,45 @@ class opts:
         opt.ambiguity_margin = 0.003
         opt.trend_scale = 0.01
         opt.appearance_cost_weight = 0.7
+        opt.enable_stm_ltm = False
+        opt.enable_memory_init_control = False
+        opt.enable_memory_matching = False
+        opt.enable_topk_matching = False
+        opt.enable_trend = False
+
+        if opt.ablation_case == '1_bot':
+            pass
+        elif opt.ablation_case == '2_stm_ltm':
+            opt.enable_stm_ltm = True
+        elif opt.ablation_case == '3_stm_ltm_memory_init':
+            opt.enable_stm_ltm = True
+            opt.enable_memory_init_control = True
+        elif opt.ablation_case == '4_stm_ltm_memory_aware':
+            opt.enable_stm_ltm = True
+            opt.enable_memory_matching = True
+        elif opt.ablation_case == '5_stm_ltm_memory_aware_topk':
+            opt.enable_stm_ltm = True
+            opt.enable_memory_matching = True
+            opt.enable_topk_matching = True
+        elif opt.ablation_case == '6_stm_ltm_memory_aware_trend':
+            opt.enable_stm_ltm = True
+            opt.enable_memory_matching = True
+            opt.enable_trend = True
+        elif opt.ablation_case == '7_stm_ltm_memory_init_memory_aware':
+            opt.enable_stm_ltm = True
+            opt.enable_memory_init_control = True
+            opt.enable_memory_matching = True
+        elif opt.ablation_case == '8_stm_ltm_memory_init_memory_aware_topk':
+            opt.enable_stm_ltm = True
+            opt.enable_memory_init_control = True
+            opt.enable_memory_matching = True
+            opt.enable_topk_matching = True
+        elif opt.ablation_case == '9_full':
+            opt.enable_stm_ltm = True
+            opt.enable_memory_init_control = True
+            opt.enable_memory_matching = True
+            opt.enable_topk_matching = True
+            opt.enable_trend = True
 
         
         if opt.BoT:
