@@ -202,57 +202,118 @@ python3 tools/visualize_results.py \
 
 ---
 
-## 6. Ablation Cases
+## 6. Ablation / Technique Switches
 
-The project supports explicit ablation cases through:
+The modified framework is controlled by combinable flags:
 
-```bash
---ablation_case
-```
+- `--ltm_stm`: enable short-term and long-term memory
+- `--memory_init`: enable delayed / gated long-memory writing
+- `--memory_aware`: enable memory-aware matching
+- `--topk`: enable top-k aggregation in memory matching
+- `--trend`: enable appearance trend
+- `--full`: enable all modifications together
 
-Available cases:
+Use one of the two entry points below:
 
-1. `1_bot`  
-   BoT only
+- **Direct tracking (`strong_sort.py`)**  
+  Use this when the sequence folder and the `.npy` file already exist.  
+  This is the best option for repeated experiments and ablation studies.
 
-2. `2_stm_ltm`  
-   BoT + STM + LTM
+- **Offline wrapper (`run_custom_video_pipeline.py`)**  
+  Use this when you want to keep the same command style as the full custom-video pipeline.  
+  If frames, detections and features are already ready, add:
+  - `--skip_extract`
+  - `--skip_detect`
+  - `--skip_features`
 
-3. `3_stm_ltm_memory_init`  
-   BoT + STM + LTM + delayed long-memory initialization
+Typical usage:
 
-4. `4_stm_ltm_memory_aware`  
-   BoT + STM + LTM + memory-aware matching
-
-5. `5_stm_ltm_memory_aware_topk`  
-   BoT + STM + LTM + memory-aware matching + top-k
-
-6. `6_stm_ltm_memory_aware_trend`  
-   BoT + STM + LTM + memory-aware matching + appearance trend
-
-7. `7_stm_ltm_memory_init_memory_aware`  
-   BoT + STM + LTM + memory init control + memory-aware matching
-
-8. `8_stm_ltm_memory_init_memory_aware_topk`  
-   BoT + STM + LTM + memory init control + memory-aware matching + top-k
-
-9. `9_full`  
-   BoT + STM + LTM + memory init control + memory-aware matching + top-k + trend
-
-Example:
+### Example 1: direct tracking from an existing `.npy`
 
 ```bash
 python3 strong_sort.py CustomDemo test \
   --BoT \
-  --ablation_case 8_stm_ltm_memory_init_memory_aware_topk \
+  --ltm_stm \
+  --memory_init \
   --root_dataset data \
-  --dir_save results/ablation_8
+  --dir_save results/memory_init
+```
+
+### Example 2: same experiment through the offline wrapper
+
+```bash
+python3 tools/run_custom_video_pipeline.py \
+  --video downloads/333.mp4 \
+  --seq YT-03 \
+  --result_dir results/ours/ablation \
+  --vis_dir results/vis/ablation \
+  --result_stem YT-03_memory_init \
+  --skip_extract \
+  --skip_detect \
+  --skip_features \
+  --ltm_stm \
+  --memory_init
+```
+
+You can replace `--ltm_stm --memory_init` by any other combination, for example:
+
+- baseline: no extra switch
+- `--ltm_stm`
+- `--ltm_stm --memory_aware`
+- `--ltm_stm --memory_aware --topk`
+- `--ltm_stm --trend`
+- `--full`
+
+Canonical combinations:
+
+```sh
+# [1] BoT baseline
+--BoT
+
+# [3] BoT + STM + LTM
+--BoT --ltm_stm
+
+# [4] BoT + STM + LTM + memory_init
+--BoT --ltm_stm --memory_init
+
+# [5] BoT + STM + LTM + memory_aware
+--BoT --ltm_stm --memory_aware
+
+# [6] BoT + STM + LTM + memory_aware + topk
+--BoT --ltm_stm --memory_aware --topk
+
+# [7] BoT + STM + LTM + trend
+--BoT --ltm_stm --trend
+
+# [8] BoT + STM + LTM + memory_init + trend
+--BoT --ltm_stm --memory_init --trend
+
+# [9] BoT + STM + LTM + memory_aware + trend
+--BoT --ltm_stm --memory_aware --trend
+
+# [10] BoT + STM + LTM + memory_aware + topk + trend
+--BoT --ltm_stm --memory_aware --topk --trend
+
+# [11] BoT + STM + LTM + memory_init + memory_aware
+--BoT --ltm_stm --memory_init --memory_aware
+
+# [12] BoT + STM + LTM + memory_init + memory_aware + topk
+--BoT --ltm_stm --memory_init --memory_aware --topk
+
+# [13] BoT + STM + LTM + memory_init + memory_aware + trend
+--BoT --ltm_stm --memory_init --memory_aware --trend
+
+# [14] BoT + STM + LTM + memory_init + memory_aware + topk + trend
+--BoT --ltm_stm --memory_init --memory_aware --topk --trend
+
+# Full
+--BoT --full
 ```
 
 Recommended baselines:
 
-- external baseline: `1_bot`
-- internal baseline: `2_stm_ltm`
+- external baseline: `BoT`
+- internal baseline: `BoT + STM + LTM`
 
 ---
 
@@ -298,24 +359,3 @@ The result `.txt` follows MOT format:
 ```text
 frame,id,x,y,w,h,1,-1,-1,-1
 ```
-
----
-
-## 9. Practical Notes
-
-- For custom videos, use `CustomDemo test` and `--root_dataset data`.
-- Do not enable `--ECC` unless the corresponding ECC json exists.
-- If you already have the `.npy`, avoid rerunning detection and feature extraction.
-- For ablation studies, prefer `strong_sort.py` over the full pipeline script.
-
----
-
-## 10. Original StrongSORT Context
-
-This repository started from StrongSORT, but the current work focuses mainly on:
-
-- BoT appearance features,
-- DeepSORT-style association,
-- memory-based modifications for appearance change.
-
-If you need the original benchmark-oriented StrongSORT usage on MOT17 / MOT20, refer to the upstream StrongSORT documentation.

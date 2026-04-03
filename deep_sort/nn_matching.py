@@ -205,6 +205,19 @@ class NearestNeighborDistanceMetric(object):
 
         return 1.0-max(-1.0, min(1.0, trend_sim))  # Convert similarity to distance
 
+    def _prototype_distance(self, feature, track):
+        if track.prototype is not None:
+            ref = track.prototype
+        elif track.prot_short is not None:
+            ref = track.prot_short
+        elif len(track.features) > 0:
+            ref = track.features[-1]
+        else:
+            return 1.0
+        ref = np.asarray(ref, dtype=np.float32).reshape(1, -1)
+        feat = np.asarray(feature, dtype=np.float32).reshape(1, -1)
+        return float(_cosine_distance(ref, feat).reshape(-1)[0])
+
     def distance_with_memory(self, features, tracks):
         cost_matrix = np.zeros((len(tracks), len(features)))
         for i, track in enumerate(tracks):
@@ -213,6 +226,20 @@ class NearestNeighborDistanceMetric(object):
                 d_long = self._cosine_distance_to_memory(feature, track.long_memory)
 
                 appearance_cost = (opt.short_distance_weight * d_short + (1 - opt.short_distance_weight) * d_long)
+                trend_cost = self._trend_consistency_cost(feature, track)
+                trend_cost = trend_cost * opt.trend_scale
+                cost_matrix[i, j] = (
+                    opt.appearance_cost_weight * appearance_cost
+                    + (1 - opt.appearance_cost_weight) * trend_cost
+                )
+        return cost_matrix
+
+    def distance_with_trend_only(self, features, tracks):
+        """Use prototype-based appearance distance plus trend, without memory-aware matching."""
+        cost_matrix = np.zeros((len(tracks), len(features)))
+        for i, track in enumerate(tracks):
+            for j, feature in enumerate(features):
+                appearance_cost = self._prototype_distance(feature, track)
                 trend_cost = self._trend_consistency_cost(feature, track)
                 trend_cost = trend_cost * opt.trend_scale
                 cost_matrix[i, j] = (

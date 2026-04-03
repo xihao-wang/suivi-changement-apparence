@@ -100,6 +100,9 @@ class Tracker:
             if opt.enable_memory_matching:
                 candidate_tracks = [tracks[i] for i in track_indices]
                 cost_matrix = self.metric.distance_with_memory(features, candidate_tracks)
+            elif opt.enable_trend_only_matching:
+                candidate_tracks = [tracks[i] for i in track_indices]
+                cost_matrix = self.metric.distance_with_trend_only(features, candidate_tracks)
             else:
                 targets = np.array([tracks[i].track_id for i in track_indices])
                 cost_matrix = self.metric.distance(features, targets)

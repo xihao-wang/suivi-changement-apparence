@@ -124,21 +124,34 @@ class opts:
             default=0.98
         )
         self.parser.add_argument(
-            '--ablation_case',
-            type=str,
-            default='9_full',
-            choices=[
-                '1_bot',
-                '2_stm_ltm',
-                '3_stm_ltm_memory_init',
-                '4_stm_ltm_memory_aware',
-                '5_stm_ltm_memory_aware_topk',
-                '6_stm_ltm_memory_aware_trend',
-                '7_stm_ltm_memory_init_memory_aware',
-                '8_stm_ltm_memory_init_memory_aware_topk',
-                '9_full',
-            ],
-            help='Explicit ablation case for the appearance-change modules.'
+            '--ltm_stm',
+            action='store_true',
+            help='Enable short-term and long-term memory.'
+        )
+        self.parser.add_argument(
+            '--memory_init',
+            action='store_true',
+            help='Enable delayed initialization / gated writing of long-term memory.'
+        )
+        self.parser.add_argument(
+            '--memory_aware',
+            action='store_true',
+            help='Enable memory-aware matching.'
+        )
+        self.parser.add_argument(
+            '--topk',
+            action='store_true',
+            help='Enable top-k aggregation for memory matching.'
+        )
+        self.parser.add_argument(
+            '--trend',
+            action='store_true',
+            help='Enable appearance-trend term.'
+        )
+        self.parser.add_argument(
+            '--full',
+            action='store_true',
+            help='Enable the full modified pipeline: STM/LTM + memory_init + memory_aware + topk + trend.'
         )
 
     def parse(self, args=''):
@@ -168,40 +181,25 @@ class opts:
         opt.enable_memory_matching = False
         opt.enable_topk_matching = False
         opt.enable_trend = False
+        opt.enable_trend_only_matching = False
 
-        if opt.ablation_case == '1_bot':
-            pass
-        elif opt.ablation_case == '2_stm_ltm':
-            opt.enable_stm_ltm = True
-        elif opt.ablation_case == '3_stm_ltm_memory_init':
-            opt.enable_stm_ltm = True
-            opt.enable_memory_init_control = True
-        elif opt.ablation_case == '4_stm_ltm_memory_aware':
-            opt.enable_stm_ltm = True
-            opt.enable_memory_matching = True
-        elif opt.ablation_case == '5_stm_ltm_memory_aware_topk':
-            opt.enable_stm_ltm = True
-            opt.enable_memory_matching = True
-            opt.enable_topk_matching = True
-        elif opt.ablation_case == '6_stm_ltm_memory_aware_trend':
-            opt.enable_stm_ltm = True
-            opt.enable_memory_matching = True
-            opt.enable_trend = True
-        elif opt.ablation_case == '7_stm_ltm_memory_init_memory_aware':
-            opt.enable_stm_ltm = True
-            opt.enable_memory_init_control = True
-            opt.enable_memory_matching = True
-        elif opt.ablation_case == '8_stm_ltm_memory_init_memory_aware_topk':
-            opt.enable_stm_ltm = True
-            opt.enable_memory_init_control = True
-            opt.enable_memory_matching = True
-            opt.enable_topk_matching = True
-        elif opt.ablation_case == '9_full':
-            opt.enable_stm_ltm = True
-            opt.enable_memory_init_control = True
-            opt.enable_memory_matching = True
-            opt.enable_topk_matching = True
-            opt.enable_trend = True
+        feature_flags = any([
+            opt.ltm_stm,
+            opt.memory_init,
+            opt.memory_aware,
+            opt.topk,
+            opt.trend,
+            opt.full,
+        ])
+
+        opt.enable_stm_ltm = (
+            opt.full or opt.ltm_stm or opt.memory_init or opt.memory_aware or opt.topk or opt.trend
+        )
+        opt.enable_memory_init_control = opt.full or opt.memory_init
+        opt.enable_memory_matching = opt.full or opt.memory_aware or opt.topk
+        opt.enable_topk_matching = opt.full or opt.topk
+        opt.enable_trend = opt.full or opt.trend
+        opt.enable_trend_only_matching = opt.trend and not opt.enable_memory_matching
 
         
         if opt.BoT:

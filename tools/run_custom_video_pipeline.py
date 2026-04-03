@@ -59,22 +59,12 @@ def parse_args():
 
     parser.add_argument("--result_stem", default=None, help="Base filename for result txt and visualization")
     parser.add_argument("--fps", type=int, default=None, help="Override fps written to seqinfo.ini and visualization")
-    parser.add_argument(
-        "--ablation_case",
-        default="9_full",
-        choices=[
-            "1_bot",
-            "2_stm_ltm",
-            "3_stm_ltm_memory_init",
-            "4_stm_ltm_memory_aware",
-            "5_stm_ltm_memory_aware_topk",
-            "6_stm_ltm_memory_aware_trend",
-            "7_stm_ltm_memory_init_memory_aware",
-            "8_stm_ltm_memory_init_memory_aware_topk",
-            "9_full",
-        ],
-        help="Appearance-change ablation case passed to StrongSORT.",
-    )
+    parser.add_argument("--ltm_stm", action="store_true", help="Enable STM + LTM")
+    parser.add_argument("--memory_init", action="store_true", help="Enable delayed long-memory initialization")
+    parser.add_argument("--memory_aware", action="store_true", help="Enable memory-aware matching")
+    parser.add_argument("--topk", action="store_true", help="Enable top-k matching")
+    parser.add_argument("--trend", action="store_true", help="Enable appearance trend")
+    parser.add_argument("--full", action="store_true", help="Enable the full modified pipeline")
 
     parser.add_argument("--ema", action="store_true", help="Enable EMA")
     parser.add_argument("--nsa", action="store_true", help="Enable NSA")
@@ -154,13 +144,19 @@ def run_strongsort(args, sequence_dir, detection_npy, result_txt):
         if repo_root_str not in sys.path:
             sys.path.insert(0, repo_root_str)
             added_repo_root = True
-        sys.argv = [
-            "strongsort_pipeline",
-            args.dataset,
-            args.split,
-            "--ablation_case",
-            args.ablation_case,
-        ]
+        sys.argv = ["strongsort_pipeline", args.dataset, args.split]
+        if args.ltm_stm:
+            sys.argv.append("--ltm_stm")
+        if args.memory_init:
+            sys.argv.append("--memory_init")
+        if args.memory_aware:
+            sys.argv.append("--memory_aware")
+        if args.topk:
+            sys.argv.append("--topk")
+        if args.trend:
+            sys.argv.append("--trend")
+        if args.full:
+            sys.argv.append("--full")
         import opts as opts_module
         from deep_sort_app import run as strongsort_run
 
