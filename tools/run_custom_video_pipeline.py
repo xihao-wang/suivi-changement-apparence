@@ -64,6 +64,11 @@ def parse_args():
     parser.add_argument("--memory_aware", action="store_true", help="Enable memory-aware matching")
     parser.add_argument("--topk", action="store_true", help="Enable top-k matching")
     parser.add_argument("--trend", action="store_true", help="Enable appearance trend")
+    parser.add_argument("--light_mam", action="store_true", help="Enable lightweight memory-attention matching")
+    parser.add_argument("--appearance_cost_weight", type=float, default=0.7, help="Weight for appearance cost")
+    parser.add_argument("--trend_cost_weight", type=float, default=0.3, help="Weight for trend cost")
+    parser.add_argument("--mam_cost_weight", type=float, default=0.3, help="Weight for lightweight MAM cost")
+    parser.add_argument("--mam_temperature", type=float, default=0.07, help="Softmax temperature for lightweight MAM")
     parser.add_argument("--full", action="store_true", help="Enable the full modified pipeline")
 
     parser.add_argument("--ema", action="store_true", help="Enable EMA")
@@ -155,6 +160,12 @@ def run_strongsort(args, sequence_dir, detection_npy, result_txt):
             sys.argv.append("--topk")
         if args.trend:
             sys.argv.append("--trend")
+        if args.light_mam:
+            sys.argv.append("--light_mam")
+        sys.argv.extend(["--appearance_cost_weight", str(args.appearance_cost_weight)])
+        sys.argv.extend(["--trend_cost_weight", str(args.trend_cost_weight)])
+        sys.argv.extend(["--mam_cost_weight", str(args.mam_cost_weight)])
+        sys.argv.extend(["--mam_temperature", str(args.mam_temperature)])
         if args.full:
             sys.argv.append("--full")
         import opts as opts_module

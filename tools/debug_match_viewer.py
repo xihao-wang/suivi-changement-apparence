@@ -34,8 +34,10 @@ class FrameReport:
     image_path: str
     detections: list[dict[str, Any]]
     tracks: list[dict[str, Any]]
+    light_mam_enabled: bool
     appearance_cost_matrix: list[list[float]]
     trend_cost_matrix: list[list[float]]
+    mam_cost_matrix: list[list[float]]
     final_cost_matrix: list[list[float]]
     raw_cost_matrix: list[list[float]]
     gated_cost_matrix: list[list[float]]
@@ -99,7 +101,7 @@ def build_reports(
         features = np.array([detections[i].feature for i in detection_indices])
 
         if len(candidate_tracks) > 0 and len(detections) > 0:
-            appearance_cost, trend_cost, final_cost = \
+            appearance_cost, trend_cost, mam_cost, final_cost = \
                 tracker.metric.distance_components_with_memory(features, candidate_tracks)
             raw_cost = final_cost
             gated_cost = linear_assignment.gate_cost_matrix(
@@ -112,6 +114,7 @@ def build_reports(
         else:
             appearance_cost = np.zeros((len(candidate_tracks), len(detections)))
             trend_cost = np.zeros((len(candidate_tracks), len(detections)))
+            mam_cost = np.zeros((len(candidate_tracks), len(detections)))
             final_cost = np.zeros((len(candidate_tracks), len(detections)))
             raw_cost = np.zeros((len(candidate_tracks), len(detections)))
             gated_cost = raw_cost.copy()
@@ -139,8 +142,10 @@ def build_reports(
                 }
                 for track in candidate_tracks
             ],
+            light_mam_enabled=bool(opt.enable_light_mam),
             appearance_cost_matrix=appearance_cost.tolist(),
             trend_cost_matrix=trend_cost.tolist(),
+            mam_cost_matrix=mam_cost.tolist(),
             final_cost_matrix=final_cost.tolist(),
             raw_cost_matrix=raw_cost.tolist(),
             gated_cost_matrix=gated_cost.tolist(),
@@ -317,14 +322,22 @@ class MatchViewerApp:
             x, y, w, h = [int(v) for v in tr["bbox_tlwh"]]
             color = create_unique_color_uchar(tr["track_id"])
             cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
+            label = f"T{tr['track_id']}"
+            label_scale = 0.55
+            label_thickness = 2
+            label_size, _ = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, label_scale, label_thickness
+            )
+            label_x = max(0, x + w - label_size[0] - 2)
+            label_y = max(label_size[1] + 2, y - 5)
             cv2.putText(
                 image,
-                f"T{tr['track_id']}",
-                (x, y + h + 18),
+                label,
+                (label_x, label_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
+                label_scale,
                 color,
-                2,
+                label_thickness,
             )
             if tr["track_id"] in report.ambiguous_track_ids:
                 cv2.putText(
@@ -409,6 +422,9 @@ class MatchViewerApp:
         self.matrix_text.insert(tk.END, self.format_matrix(report.appearance_cost_matrix, report))
         self.matrix_text.insert(tk.END, "\nTrend cost matrix\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.trend_cost_matrix, report))
+        if report.light_mam_enabled:
+            self.matrix_text.insert(tk.END, "\nLight MAM cost matrix\n")
+            self.matrix_text.insert(tk.END, self.format_matrix(report.mam_cost_matrix, report))
         self.matrix_text.insert(tk.END, "\nFinal cost matrix(before gating)\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.final_cost_matrix, report))
         self.matrix_text.insert(tk.END, "\nGated distance matrix(motion / Kalman gating)\n")
@@ -438,26 +454,61 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Interactive viewer for track/detection matching.")
     parser.add_argument("--sequence_dir", required=True)
     parser.add_argument("--detection_file", required=True)
-    parser.add_argument("--min_confidence", type=float, default=0.8)
-    parser.add_argument("--min_detection_height", type=int, default=0)
-    parser.add_argument("--nms_max_overlap", type=float, default=1.0)
-    parser.add_argument("--max_cosine_distance", type=float, default=0.2)
+    # By default, keep these aligned with opts.py / the main pipeline.
+    parser.add_argument("--min_confidence", type=float, default=None)
+    parser.add_argument("--min_detection_height", type=int, default=None)
+    parser.add_argument("--nms_max_overlap", type=float, default=None)
+    parser.add_argument("--max_cosine_distance", type=float, default=None)
     parser.add_argument("--nn_budget", type=int, default=None)
+    parser.add_argument("--BoT", action="store_true", help="Use BoT feature settings.")
+    parser.add_argument("--ltm_stm", action="store_true", help="Enable STM + LTM.")
+    parser.add_argument("--memory_init", action="store_true", help="Enable delayed long-memory initialization.")
+    parser.add_argument("--memory_aware", action="store_true", help="Enable memory-aware matching.")
+    parser.add_argument("--topk", action="store_true", help="Enable top-k memory matching.")
+    parser.add_argument("--trend", action="store_true", help="Enable appearance trend.")
+    parser.add_argument("--light_mam", action="store_true", help="Enable lightweight MAM cost.")
+    parser.add_argument("--full", action="store_true", help="Enable full modified pipeline.")
+    parser.add_argument("--appearance_cost_weight", type=float, default=0.7)
+    parser.add_argument("--trend_cost_weight", type=float, default=0.3)
+    parser.add_argument("--mam_cost_weight", type=float, default=0.3)
+    parser.add_argument("--mam_temperature", type=float, default=0.07)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    sys.argv = [sys.argv[0], "CustomDemo", "test"]
+    opt_args = [sys.argv[0], "CustomDemo", "test"]
+    for flag in (
+        "BoT",
+        "ltm_stm",
+        "memory_init",
+        "memory_aware",
+        "topk",
+        "trend",
+        "light_mam",
+        "full",
+    ):
+        if getattr(args, flag):
+            opt_args.append(f"--{flag}")
+    opt_args.extend(["--appearance_cost_weight", str(args.appearance_cost_weight)])
+    opt_args.extend(["--trend_cost_weight", str(args.trend_cost_weight)])
+    opt_args.extend(["--mam_cost_weight", str(args.mam_cost_weight)])
+    opt_args.extend(["--mam_temperature", str(args.mam_temperature)])
+    sys.argv = opt_args
+
+    # Import opts only after sys.argv has been rewritten so the viewer uses
+    # the exact same parsed configuration as the main tracking pipeline.
+    from opts import opt
+
     print("Preparing frame reports. This may take a moment...")
     reports, min_frame, max_frame = build_reports(
         sequence_dir=args.sequence_dir,
         detection_file=args.detection_file,
-        min_confidence=args.min_confidence,
-        nms_max_overlap=args.nms_max_overlap,
-        min_detection_height=args.min_detection_height,
-        max_cosine_distance=args.max_cosine_distance,
-        nn_budget=args.nn_budget,
+        min_confidence=opt.min_confidence if args.min_confidence is None else args.min_confidence,
+        nms_max_overlap=opt.nms_max_overlap if args.nms_max_overlap is None else args.nms_max_overlap,
+        min_detection_height=opt.min_detection_height if args.min_detection_height is None else args.min_detection_height,
+        max_cosine_distance=opt.max_cosine_distance if args.max_cosine_distance is None else args.max_cosine_distance,
+        nn_budget=opt.nn_budget if args.nn_budget is None else args.nn_budget,
     )
     print(f"Loaded {len(reports)} frames.")
     root = tk.Tk()

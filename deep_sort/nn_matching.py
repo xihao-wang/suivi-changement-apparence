@@ -218,6 +218,58 @@ class NearestNeighborDistanceMetric(object):
         feat = np.asarray(feature, dtype=np.float32).reshape(1, -1)
         return float(_cosine_distance(ref, feat).reshape(-1)[0])
 
+    def _lightweight_mam_cost(self, feature, track):
+        """Attention-style memory cost for a track-detection pair.
+
+        The candidate detection is used as a query over confirmed track memory.
+        We only return a matching cost here; the track memory is not updated
+        until the association is accepted by the tracker.
+        """
+        if not opt.enable_light_mam:
+            return 0.0
+
+        memory_tokens = []
+        if track.prot_long is not None:
+            memory_tokens.append(track.prot_long)
+        if track.prot_short is not None:
+            memory_tokens.append(track.prot_short)
+        memory_tokens.extend(track.short_memory)
+
+        if len(memory_tokens) == 0:
+            return 1.0
+
+        memory_tokens = np.asarray(memory_tokens, dtype=np.float32)
+        query = np.asarray(feature, dtype=np.float32).reshape(1, -1)
+
+        memory_norm = np.linalg.norm(memory_tokens, axis=1, keepdims=True)
+        query_norm = np.linalg.norm(query, axis=1, keepdims=True)
+        memory_tokens = memory_tokens / np.maximum(memory_norm, 1e-12)
+        query = query / np.maximum(query_norm, 1e-12)
+
+        temperature = max(float(opt.mam_temperature), 1e-6)
+        scores = np.dot(memory_tokens, query.reshape(-1)) / temperature
+        scores = scores - np.max(scores)
+        weights = np.exp(scores)
+        weights = weights / np.maximum(np.sum(weights), 1e-12)
+
+        context = np.sum(weights[:, None] * memory_tokens, axis=0, keepdims=True)
+        context_norm = np.linalg.norm(context, axis=1, keepdims=True)
+        context = context / np.maximum(context_norm, 1e-12)
+
+        return float(_cosine_distance(context, query, data_is_normalized=True).reshape(-1)[0])
+
+    def _combine_costs(self, appearance_cost, trend_cost, mam_cost):
+        cost_terms = [(opt.appearance_cost_weight, appearance_cost)]
+        if opt.enable_trend:
+            cost_terms.append((opt.trend_cost_weight, trend_cost))
+        if opt.enable_light_mam:
+            cost_terms.append((opt.mam_cost_weight, mam_cost))
+
+        weight_sum = sum(weight for weight, _ in cost_terms)
+        if weight_sum <= 0:
+            return appearance_cost
+        return sum(weight * cost for weight, cost in cost_terms) / weight_sum
+
     def distance_with_memory(self, features, tracks):
         cost_matrix = np.zeros((len(tracks), len(features)))
         for i, track in enumerate(tracks):
@@ -228,9 +280,9 @@ class NearestNeighborDistanceMetric(object):
                 appearance_cost = (opt.short_distance_weight * d_short + (1 - opt.short_distance_weight) * d_long)
                 trend_cost = self._trend_consistency_cost(feature, track)
                 trend_cost = trend_cost * opt.trend_scale
-                cost_matrix[i, j] = (
-                    opt.appearance_cost_weight * appearance_cost
-                    + (1 - opt.appearance_cost_weight) * trend_cost
+                mam_cost = self._lightweight_mam_cost(feature, track)
+                cost_matrix[i, j] = self._combine_costs(
+                    appearance_cost, trend_cost, mam_cost
                 )
         return cost_matrix
 
@@ -242,16 +294,17 @@ class NearestNeighborDistanceMetric(object):
                 appearance_cost = self._prototype_distance(feature, track)
                 trend_cost = self._trend_consistency_cost(feature, track)
                 trend_cost = trend_cost * opt.trend_scale
-                cost_matrix[i, j] = (
-                    opt.appearance_cost_weight * appearance_cost
-                    + (1 - opt.appearance_cost_weight) * trend_cost
+                mam_cost = self._lightweight_mam_cost(feature, track)
+                cost_matrix[i, j] = self._combine_costs(
+                    appearance_cost, trend_cost, mam_cost
                 )
         return cost_matrix
 
     def distance_components_with_memory(self, features, tracks):
-        """Return appearance, trend, and final cost matrices for debugging."""
+        """Return appearance, trend, MAM, and final cost matrices for debugging."""
         appearance_matrix = np.zeros((len(tracks), len(features)))
         trend_matrix = np.zeros((len(tracks), len(features)))
+        mam_matrix = np.zeros((len(tracks), len(features)))
         final_matrix = np.zeros((len(tracks), len(features)))
 
         for i, track in enumerate(tracks):
@@ -265,13 +318,14 @@ class NearestNeighborDistanceMetric(object):
                 )
                 trend_cost = self._trend_consistency_cost(feature, track)
                 trend_cost = trend_cost * opt.trend_scale
-                final_cost = (
-                    opt.appearance_cost_weight * appearance_cost
-                    + (1 - opt.appearance_cost_weight) * trend_cost
+                mam_cost = self._lightweight_mam_cost(feature, track)
+                final_cost = self._combine_costs(
+                    appearance_cost, trend_cost, mam_cost
                 )
 
                 appearance_matrix[i, j] = appearance_cost
                 trend_matrix[i, j] = trend_cost
+                mam_matrix[i, j] = mam_cost
                 final_matrix[i, j] = final_cost
 
-        return appearance_matrix, trend_matrix, final_matrix
+        return appearance_matrix, trend_matrix, mam_matrix, final_matrix

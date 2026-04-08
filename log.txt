@@ -57,3 +57,6 @@ technique 2 (Introduction; Section 3.1 Overall framework): spatial-temporal dual
 technique 3 (Abstract; Section 3.1; Section 3.3): Temporal Information Extractor, TIE (use the initial template, the current search region, and adjacent search regions to learn temporal representations of the target across frames), which helps the tracker perceive immediate appearance change rather than only static target appearance.
 technique 4 (Abstract; Section 3.1; Section 3.4): spatial-temporal context enhanced fusion, STF (fuse spatial information from SIE and temporal information from TIE before final prediction), which helps combine frame-level localization cues with short-term appearance-change cues.
 technique 5 (Section 3.4; Fig. 6(c); Table 6; Table 7): multi-scale location-aware fusion, MSLA (perform multi-scale fusion of spatial and temporal features with location-aware weighting), which helps improve the effectiveness of spatial-temporal fusion beyond simple summation or single-scale fusion.
+
+
+0408_0900  : I attempted to implement the MAM blocks from the 2024 paper, where “track long” corresponds to the initial template, “track short” corresponds to the adjacent search region, and “current detection” corresponds to the current search region. However, the final result turned out to be a simplified version of the appearance cost (baseline).

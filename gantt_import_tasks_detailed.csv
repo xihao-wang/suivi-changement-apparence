@@ -38,7 +38,7 @@ Outline Level,ID,Name,Start,Finish,Duration,% Complete,Predecessors,Resource Nam
 1,40,"S7 - Viewer de debug",2026-03-23,2026-03-27,5 day,100,"","",,""
 1,41,"S7 - Premier rapport mensuel",2026-03-30,2026-04-03,5 day,100,"40FS","",,"<p><br></p>"
 1,42,"S7 - Lecture complementaire sur le changement d'apparence",2026-03-23,2026-04-03,10 day,100,"","",,""
-1,43,"Phase 4 - Repositionnement guide par la litterature",2026-03-30,2026-04-17,15 day,100,"","",31,"<p><br></p>"
+1,43,"Phase 4 - Repositionnement guide par la litterature",2026-03-30,2026-04-17,15 day,40,"","",31,"<p><br></p>"
 1,44,"S8 - Evaluation separee des modules",2026-03-30,2026-04-03,5 day,100,"","",,"<p><br></p>"
 1,45,"S8 - Lecture des articles recommandes",2026-03-30,2026-04-10,10 day,50,"","",,"<p><br></p>"
 1,46,"S8 - Tableau des techniques pertinentes",2026-03-30,2026-04-10,10 day,50,"","",,"<p><br></p>"

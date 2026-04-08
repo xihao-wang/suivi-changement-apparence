@@ -149,6 +149,35 @@ class opts:
             help='Enable appearance-trend term.'
         )
         self.parser.add_argument(
+            '--light_mam',
+            action='store_true',
+            help='Enable lightweight memory-attention matching.'
+        )
+        self.parser.add_argument(
+            '--appearance_cost_weight',
+            type=float,
+            default=0.7,
+            help='Weight for appearance cost in combined matching.'
+        )
+        self.parser.add_argument(
+            '--trend_cost_weight',
+            type=float,
+            default=0.3,
+            help='Weight for trend cost in combined matching.'
+        )
+        self.parser.add_argument(
+            '--mam_cost_weight',
+            type=float,
+            default=0.3,
+            help='Weight for lightweight MAM cost in combined matching.'
+        )
+        self.parser.add_argument(
+            '--mam_temperature',
+            type=float,
+            default=0.07,
+            help='Softmax temperature for lightweight MAM attention.'
+        )
+        self.parser.add_argument(
             '--full',
             action='store_true',
             help='Enable the full modified pipeline: STM/LTM + memory_init + memory_aware + topk + trend.'
@@ -175,13 +204,13 @@ class opts:
         opt.ambiguity_distance_threshold = 0.02
         opt.ambiguity_margin = 0.003
         opt.trend_scale = 0.01
-        opt.appearance_cost_weight = 0.7
         opt.enable_stm_ltm = False
         opt.enable_memory_init_control = False
         opt.enable_memory_matching = False
         opt.enable_topk_matching = False
         opt.enable_trend = False
         opt.enable_trend_only_matching = False
+        opt.enable_light_mam = False
 
         feature_flags = any([
             opt.ltm_stm,
@@ -189,17 +218,19 @@ class opts:
             opt.memory_aware,
             opt.topk,
             opt.trend,
+            opt.light_mam,
             opt.full,
         ])
 
         opt.enable_stm_ltm = (
-            opt.full or opt.ltm_stm or opt.memory_init or opt.memory_aware or opt.topk or opt.trend
+            opt.full or opt.ltm_stm or opt.memory_init or opt.memory_aware or opt.topk or opt.trend or opt.light_mam
         )
         opt.enable_memory_init_control = opt.full or opt.memory_init
-        opt.enable_memory_matching = opt.full or opt.memory_aware or opt.topk
+        opt.enable_memory_matching = opt.full or opt.memory_aware or opt.topk or opt.light_mam
         opt.enable_topk_matching = opt.full or opt.topk
         opt.enable_trend = opt.full or opt.trend
         opt.enable_trend_only_matching = opt.trend and not opt.enable_memory_matching
+        opt.enable_light_mam = opt.light_mam
 
         
         if opt.BoT:
