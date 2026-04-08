@@ -317,10 +317,16 @@ class MatchViewerApp:
             x, y, w, h = [int(v) for v in tr["bbox_tlwh"]]
             color = create_unique_color_uchar(tr["track_id"])
             cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
+            label = f"T{tr['track_id']}"
+            (text_w, text_h), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
+            )
+            text_x = min(max(0, x + w - text_w), max(0, image.shape[1] - text_w - 1))
+            text_y = max(text_h + 2, y - 6)
             cv2.putText(
                 image,
-                f"T{tr['track_id']}",
-                (x, y + h + 18),
+                label,
+                (text_x, text_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 color,
@@ -438,26 +444,74 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Interactive viewer for track/detection matching.")
     parser.add_argument("--sequence_dir", required=True)
     parser.add_argument("--detection_file", required=True)
-    parser.add_argument("--min_confidence", type=float, default=0.8)
-    parser.add_argument("--min_detection_height", type=int, default=0)
-    parser.add_argument("--nms_max_overlap", type=float, default=1.0)
-    parser.add_argument("--max_cosine_distance", type=float, default=0.2)
+    parser.add_argument("--BoT", action="store_true", help="Use BoT configuration")
+    parser.add_argument("--ECC", action="store_true", help="Enable ECC")
+    parser.add_argument("--NSA", action="store_true", help="Enable NSA")
+    parser.add_argument("--EMA", action="store_true", help="Enable EMA")
+    parser.add_argument("--MC", action="store_true", help="Enable MC")
+    parser.add_argument("--woC", action="store_true", help="Enable woC")
+    parser.add_argument("--ltm_stm", action="store_true", help="Enable STM + LTM")
+    parser.add_argument("--memory_init", action="store_true", help="Enable delayed long-memory initialization")
+    parser.add_argument("--memory_aware", action="store_true", help="Enable memory-aware matching")
+    parser.add_argument("--topk", action="store_true", help="Enable top-k matching")
+    parser.add_argument("--trend", action="store_true", help="Enable appearance trend")
+    parser.add_argument("--full", action="store_true", help="Enable full modified pipeline")
+    parser.add_argument("--min_confidence", type=float, default=None)
+    parser.add_argument("--min_detection_height", type=int, default=None)
+    parser.add_argument("--nms_max_overlap", type=float, default=None)
+    parser.add_argument("--max_cosine_distance", type=float, default=None)
     parser.add_argument("--nn_budget", type=int, default=None)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    sys.argv = [sys.argv[0], "CustomDemo", "test"]
+    opt_argv = [sys.argv[0], "CustomDemo", "test"]
+    if args.BoT:
+        opt_argv.append("--BoT")
+    if args.ECC:
+        opt_argv.append("--ECC")
+    if args.NSA:
+        opt_argv.append("--NSA")
+    if args.EMA:
+        opt_argv.append("--EMA")
+    if args.MC:
+        opt_argv.append("--MC")
+    if args.woC:
+        opt_argv.append("--woC")
+    if args.ltm_stm:
+        opt_argv.append("--ltm_stm")
+    if args.memory_init:
+        opt_argv.append("--memory_init")
+    if args.memory_aware:
+        opt_argv.append("--memory_aware")
+    if args.topk:
+        opt_argv.append("--topk")
+    if args.trend:
+        opt_argv.append("--trend")
+    if args.full:
+        opt_argv.append("--full")
+    sys.argv = opt_argv
+    from opts import opt
+
     print("Preparing frame reports. This may take a moment...")
+    min_confidence = opt.min_confidence if args.min_confidence is None else args.min_confidence
+    min_detection_height = (
+        opt.min_detection_height if args.min_detection_height is None else args.min_detection_height
+    )
+    nms_max_overlap = opt.nms_max_overlap if args.nms_max_overlap is None else args.nms_max_overlap
+    max_cosine_distance = (
+        opt.max_cosine_distance if args.max_cosine_distance is None else args.max_cosine_distance
+    )
+    nn_budget = opt.nn_budget if args.nn_budget is None else args.nn_budget
     reports, min_frame, max_frame = build_reports(
         sequence_dir=args.sequence_dir,
         detection_file=args.detection_file,
-        min_confidence=args.min_confidence,
-        nms_max_overlap=args.nms_max_overlap,
-        min_detection_height=args.min_detection_height,
-        max_cosine_distance=args.max_cosine_distance,
-        nn_budget=args.nn_budget,
+        min_confidence=min_confidence,
+        nms_max_overlap=nms_max_overlap,
+        min_detection_height=min_detection_height,
+        max_cosine_distance=max_cosine_distance,
+        nn_budget=nn_budget,
     )
     print(f"Loaded {len(reports)} frames.")
     root = tk.Tk()

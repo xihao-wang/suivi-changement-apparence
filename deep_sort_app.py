@@ -244,7 +244,7 @@ def parse_args():
     parser.add_argument(
         "--min_confidence", help="Detection confidence threshold. Disregard "
         "all detections that have a confidence lower than this value.",
-        default=0.8, type=float)
+        default=0.6, type=float)
     parser.add_argument(
         "--min_detection_height", help="Threshold on the detection bounding "
         "box height. Detections with height smaller than this value are "
@@ -254,10 +254,10 @@ def parse_args():
         "detection overlap.", default=1.0, type=float)
     parser.add_argument(
         "--max_cosine_distance", help="Gating threshold for cosine distance "
-        "metric (object appearance).", type=float, default=0.2)
+        "metric (object appearance).", type=float, default=0.4)
     parser.add_argument(
         "--nn_budget", help="Maximum size of the appearance descriptors "
-        "gallery. If None, no budget is enforced.", type=int, default=None)
+        "gallery. If None, no budget is enforced.", type=int, default=100)
     parser.add_argument(
         "--display", help="Show intermediate tracking results",
         default=True, type=bool_string)

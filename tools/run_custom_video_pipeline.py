@@ -145,6 +145,21 @@ def run_strongsort(args, sequence_dir, detection_npy, result_txt):
             sys.path.insert(0, repo_root_str)
             added_repo_root = True
         sys.argv = ["strongsort_pipeline", args.dataset, args.split]
+        sys.argv.append("--BoT")
+        if args.ecc:
+            sys.argv.append("--ECC")
+        if args.nsa:
+            sys.argv.append("--NSA")
+        if args.ema:
+            sys.argv.append("--EMA")
+        if args.mc:
+            sys.argv.append("--MC")
+        if args.woc:
+            sys.argv.append("--woC")
+        if args.aflink:
+            sys.argv.append("--AFLink")
+        if args.gsi:
+            sys.argv.append("--GSI")
         if args.ltm_stm:
             sys.argv.append("--ltm_stm")
         if args.memory_init:
@@ -177,13 +192,6 @@ def run_strongsort(args, sequence_dir, detection_npy, result_txt):
         opt.AFLink = args.aflink
         opt.GSI = args.gsi
         opt.path_AFLink = args.aflink_weights
-        opt.nms_max_overlap = 1.0
-        opt.min_confidence = 0.6
-        opt.min_detection_height = 0
-        opt.max_cosine_distance = 0.4
-        if opt.MC:
-            opt.max_cosine_distance += 0.05
-        opt.nn_budget = 1 if opt.EMA else 100
         if opt.ECC:
             ecc_path = args.ecc_json or str(Path("data/StrongSORT_data") / f"{args.dataset}_ECC_{args.split}.json")
             with open(ecc_path) as f:

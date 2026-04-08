@@ -332,10 +332,37 @@ Use the viewer to inspect:
 - gated cost,
 - ambiguity warnings.
 
+The viewer can also use the same technique switches as the main tracking code:
+
+- `--BoT`
+- `--ltm_stm`
+- `--memory_init`
+- `--memory_aware`
+- `--topk`
+- `--trend`
+- `--full`
+
+If you do not manually override thresholds such as `min_confidence` or
+`max_cosine_distance`, the viewer now follows the values parsed from
+`opts.py`, so it is easier to keep it consistent with the main pipeline.
+
 ```bash
 python3 tools/debug_match_viewer.py \
   --sequence_dir data/CustomDemo/test/YT-03 \
   --detection_file data/StrongSORT_data/CustomDemo_test_YOLOX+BoT/YT-03.npy
+```
+
+Example with the same switches as a tracking run:
+
+```bash
+python3 tools/debug_match_viewer.py \
+  --sequence_dir data/CustomDemo/test/YT-03 \
+  --detection_file data/StrongSORT_data/CustomDemo_test_YOLOX+BoT/YT-03.npy \
+  --BoT \
+  --ltm_stm \
+  --memory_init \
+  --memory_aware \
+  --trend
 ```
 
 ### Keyboard shortcuts
