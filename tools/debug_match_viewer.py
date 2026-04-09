@@ -35,7 +35,6 @@ class FrameReport:
     detections: list[dict[str, Any]]
     tracks: list[dict[str, Any]]
     appearance_cost_matrix: list[list[float]]
-    trend_cost_matrix: list[list[float]]
     final_cost_matrix: list[list[float]]
     raw_cost_matrix: list[list[float]]
     gated_cost_matrix: list[list[float]]
@@ -99,7 +98,7 @@ def build_reports(
         features = np.array([detections[i].feature for i in detection_indices])
 
         if len(candidate_tracks) > 0 and len(detections) > 0:
-            appearance_cost, trend_cost, final_cost = \
+            appearance_cost, final_cost = \
                 tracker.metric.distance_components_with_memory(features, candidate_tracks)
             raw_cost = final_cost
             gated_cost = linear_assignment.gate_cost_matrix(
@@ -111,7 +110,6 @@ def build_reports(
             )
         else:
             appearance_cost = np.zeros((len(candidate_tracks), len(detections)))
-            trend_cost = np.zeros((len(candidate_tracks), len(detections)))
             final_cost = np.zeros((len(candidate_tracks), len(detections)))
             raw_cost = np.zeros((len(candidate_tracks), len(detections)))
             gated_cost = raw_cost.copy()
@@ -140,7 +138,6 @@ def build_reports(
                 for track in candidate_tracks
             ],
             appearance_cost_matrix=appearance_cost.tolist(),
-            trend_cost_matrix=trend_cost.tolist(),
             final_cost_matrix=final_cost.tolist(),
             raw_cost_matrix=raw_cost.tolist(),
             gated_cost_matrix=gated_cost.tolist(),
@@ -413,8 +410,6 @@ class MatchViewerApp:
 
         self.matrix_text.insert(tk.END, "Appearance cost matrix\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.appearance_cost_matrix, report))
-        self.matrix_text.insert(tk.END, "\nTrend cost matrix\n")
-        self.matrix_text.insert(tk.END, self.format_matrix(report.trend_cost_matrix, report))
         self.matrix_text.insert(tk.END, "\nFinal cost matrix(before gating)\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.final_cost_matrix, report))
         self.matrix_text.insert(tk.END, "\nGated distance matrix(motion / Kalman gating)\n")
@@ -454,7 +449,6 @@ def parse_args():
     parser.add_argument("--memory_init", action="store_true", help="Enable delayed long-memory initialization")
     parser.add_argument("--memory_aware", action="store_true", help="Enable memory-aware matching")
     parser.add_argument("--topk", action="store_true", help="Enable top-k matching")
-    parser.add_argument("--trend", action="store_true", help="Enable appearance trend")
     parser.add_argument("--full", action="store_true", help="Enable full modified pipeline")
     parser.add_argument("--min_confidence", type=float, default=None)
     parser.add_argument("--min_detection_height", type=int, default=None)
@@ -487,8 +481,6 @@ def main():
         opt_argv.append("--memory_aware")
     if args.topk:
         opt_argv.append("--topk")
-    if args.trend:
-        opt_argv.append("--trend")
     if args.full:
         opt_argv.append("--full")
     sys.argv = opt_argv

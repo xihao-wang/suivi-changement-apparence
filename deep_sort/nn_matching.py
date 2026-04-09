@@ -190,21 +190,6 @@ class NearestNeighborDistanceMetric(object):
             return float(np.mean(topk))
         return float(np.min(distances))
 
-    def _trend_consistency_cost(self, feature, track):
-        if not opt.enable_trend:
-            return 0.0
-        if track.prot_short is None or track.appearance_trend is None:
-            return 1.0
-        
-        delta = feature - track.prot_short
-        delta_norm = np.linalg.norm(delta)
-        if delta_norm < 1e-6:
-            return 0.0
-        delta /= delta_norm  # Normalize the trend vector
-        trend_sim = float(np.dot(delta, track.appearance_trend))
-
-        return 1.0-max(-1.0, min(1.0, trend_sim))  # Convert similarity to distance
-
     def _prototype_distance(self, feature, track):
         if track.prototype is not None:
             ref = track.prototype
@@ -225,33 +210,16 @@ class NearestNeighborDistanceMetric(object):
                 d_short = self._cosine_distance_to_memory(feature, track.short_memory)
                 d_long = self._cosine_distance_to_memory(feature, track.long_memory)
 
-                appearance_cost = (opt.short_distance_weight * d_short + (1 - opt.short_distance_weight) * d_long)
-                trend_cost = self._trend_consistency_cost(feature, track)
-                trend_cost = trend_cost * opt.trend_scale
-                cost_matrix[i, j] = (
-                    opt.appearance_cost_weight * appearance_cost
-                    + (1 - opt.appearance_cost_weight) * trend_cost
+                appearance_cost = (
+                    opt.short_distance_weight * d_short
+                    + (1 - opt.short_distance_weight) * d_long
                 )
-        return cost_matrix
-
-    def distance_with_trend_only(self, features, tracks):
-        """Use prototype-based appearance distance plus trend, without memory-aware matching."""
-        cost_matrix = np.zeros((len(tracks), len(features)))
-        for i, track in enumerate(tracks):
-            for j, feature in enumerate(features):
-                appearance_cost = self._prototype_distance(feature, track)
-                trend_cost = self._trend_consistency_cost(feature, track)
-                trend_cost = trend_cost * opt.trend_scale
-                cost_matrix[i, j] = (
-                    opt.appearance_cost_weight * appearance_cost
-                    + (1 - opt.appearance_cost_weight) * trend_cost
-                )
+                cost_matrix[i, j] = appearance_cost
         return cost_matrix
 
     def distance_components_with_memory(self, features, tracks):
-        """Return appearance, trend, and final cost matrices for debugging."""
+        """Return appearance and final cost matrices for debugging."""
         appearance_matrix = np.zeros((len(tracks), len(features)))
-        trend_matrix = np.zeros((len(tracks), len(features)))
         final_matrix = np.zeros((len(tracks), len(features)))
 
         for i, track in enumerate(tracks):
@@ -263,15 +231,9 @@ class NearestNeighborDistanceMetric(object):
                     opt.short_distance_weight * d_short
                     + (1 - opt.short_distance_weight) * d_long
                 )
-                trend_cost = self._trend_consistency_cost(feature, track)
-                trend_cost = trend_cost * opt.trend_scale
-                final_cost = (
-                    opt.appearance_cost_weight * appearance_cost
-                    + (1 - opt.appearance_cost_weight) * trend_cost
-                )
+                final_cost = appearance_cost
 
                 appearance_matrix[i, j] = appearance_cost
-                trend_matrix[i, j] = trend_cost
                 final_matrix[i, j] = final_cost
 
-        return appearance_matrix, trend_matrix, final_matrix
+        return appearance_matrix, final_matrix

@@ -144,14 +144,9 @@ class opts:
             help='Enable top-k aggregation for memory matching.'
         )
         self.parser.add_argument(
-            '--trend',
-            action='store_true',
-            help='Enable appearance-trend term.'
-        )
-        self.parser.add_argument(
             '--full',
             action='store_true',
-            help='Enable the full modified pipeline: STM/LTM + memory_init + memory_aware + topk + trend.'
+            help='Enable the full modified pipeline: STM/LTM + memory_init + memory_aware + topk.'
         )
 
     def parse(self, args=''):
@@ -174,32 +169,17 @@ class opts:
         opt.k = 3 # Number of top distances to consider for k-top cosine distance(in nn_matching.py, _cosine_distance_to_memory function)
         opt.ambiguity_distance_threshold = 0.02
         opt.ambiguity_margin = 0.003
-        opt.trend_scale = 0.01
-        opt.appearance_cost_weight = 0.7
         opt.enable_stm_ltm = False
         opt.enable_memory_init_control = False
         opt.enable_memory_matching = False
         opt.enable_topk_matching = False
-        opt.enable_trend = False
-        opt.enable_trend_only_matching = False
-
-        feature_flags = any([
-            opt.ltm_stm,
-            opt.memory_init,
-            opt.memory_aware,
-            opt.topk,
-            opt.trend,
-            opt.full,
-        ])
 
         opt.enable_stm_ltm = (
-            opt.full or opt.ltm_stm or opt.memory_init or opt.memory_aware or opt.topk or opt.trend
+            opt.full or opt.ltm_stm or opt.memory_init or opt.memory_aware or opt.topk
         )
         opt.enable_memory_init_control = opt.full or opt.memory_init
         opt.enable_memory_matching = opt.full or opt.memory_aware or opt.topk
         opt.enable_topk_matching = opt.full or opt.topk
-        opt.enable_trend = opt.full or opt.trend
-        opt.enable_trend_only_matching = opt.trend and not opt.enable_memory_matching
 
         
         if opt.BoT:

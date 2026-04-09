@@ -86,7 +86,6 @@ class Track:
         self.prot_short = None
         self.prot_long = None
         self.prototype = None
-        self.appearance_trend = None
         if feature is not None:
             if opt.enable_stm_ltm:
                 self.short_memory.append(feature)
@@ -197,20 +196,6 @@ class Track:
 
         self.prot_short = np.mean(self.short_memory, axis=0)
         self.prot_short /= np.linalg.norm(self.prot_short)
-
-        # estimate appearance trend from recent appearance evolution
-        if opt.enable_trend and len(self.short_memory) >= 2:
-            diffs = []
-            for i in range(1, len(self.short_memory)):
-                diffs.append(self.short_memory[i] - self.short_memory[i-1])
-            trend = np.mean(diffs, axis=0)
-            norm = np.linalg.norm(trend)
-            if norm > 0:
-                self.appearance_trend = trend / norm
-            else:
-                self.appearance_trend = None
-        else:
-            self.appearance_trend = None
 
         self.hits += 1
 
