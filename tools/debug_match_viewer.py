@@ -35,6 +35,10 @@ class FrameReport:
     detections: list[dict[str, Any]]
     tracks: list[dict[str, Any]]
     appearance_cost_matrix: list[list[float]]
+    temporal_cost_matrix: list[list[float]]
+    temporal_s1_matrix: list[list[float]]
+    temporal_s2_matrix: list[list[float]]
+    temporal_c_matrix: list[list[float]]
     final_cost_matrix: list[list[float]]
     raw_cost_matrix: list[list[float]]
     gated_cost_matrix: list[list[float]]
@@ -98,7 +102,7 @@ def build_reports(
         features = np.array([detections[i].feature for i in detection_indices])
 
         if len(candidate_tracks) > 0 and len(detections) > 0:
-            appearance_cost, final_cost = \
+            appearance_cost, temporal_cost, temporal_s1, temporal_s2, temporal_c, final_cost = \
                 tracker.metric.distance_components_with_memory(features, candidate_tracks)
             raw_cost = final_cost
             gated_cost = linear_assignment.gate_cost_matrix(
@@ -110,6 +114,10 @@ def build_reports(
             )
         else:
             appearance_cost = np.zeros((len(candidate_tracks), len(detections)))
+            temporal_cost = np.zeros((len(candidate_tracks), len(detections)))
+            temporal_s1 = np.zeros((len(candidate_tracks), len(detections)))
+            temporal_s2 = np.zeros((len(candidate_tracks), len(detections)))
+            temporal_c = np.zeros((len(candidate_tracks), len(detections)))
             final_cost = np.zeros((len(candidate_tracks), len(detections)))
             raw_cost = np.zeros((len(candidate_tracks), len(detections)))
             gated_cost = raw_cost.copy()
@@ -138,6 +146,10 @@ def build_reports(
                 for track in candidate_tracks
             ],
             appearance_cost_matrix=appearance_cost.tolist(),
+            temporal_cost_matrix=temporal_cost.tolist(),
+            temporal_s1_matrix=temporal_s1.tolist(),
+            temporal_s2_matrix=temporal_s2.tolist(),
+            temporal_c_matrix=temporal_c.tolist(),
             final_cost_matrix=final_cost.tolist(),
             raw_cost_matrix=raw_cost.tolist(),
             gated_cost_matrix=gated_cost.tolist(),
@@ -299,14 +311,14 @@ class MatchViewerApp:
 
         for det in report.detections:
             x, y, w, h = [int(v) for v in det["bbox_tlwh"]]
-            cv2.rectangle(image, (x, y), (x + w, y + h), (0, 0, 255), 2)
+            cv2.rectangle(image, (x, y), (x + w, y + h), (255, 255, 255), 2)
             cv2.putText(
                 image,
                 f"D{det['index']} {det['confidence']:.2f}",
                 (x, max(15, y - 5)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
-                (0, 0, 255),
+                (255, 255, 255),
                 2,
             )
 
@@ -410,6 +422,14 @@ class MatchViewerApp:
 
         self.matrix_text.insert(tk.END, "Appearance cost matrix\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.appearance_cost_matrix, report))
+        self.matrix_text.insert(tk.END, "\nTemporal order cost matrix\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.temporal_cost_matrix, report))
+        self.matrix_text.insert(tk.END, "\nTemporal s1 matrix\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.temporal_s1_matrix, report))
+        self.matrix_text.insert(tk.END, "\nTemporal s2 matrix\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.temporal_s2_matrix, report))
+        self.matrix_text.insert(tk.END, "\nTemporal c matrix\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.temporal_c_matrix, report))
         self.matrix_text.insert(tk.END, "\nFinal cost matrix(before gating)\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.final_cost_matrix, report))
         self.matrix_text.insert(tk.END, "\nGated distance matrix(motion / Kalman gating)\n")
@@ -449,6 +469,7 @@ def parse_args():
     parser.add_argument("--memory_init", action="store_true", help="Enable delayed long-memory initialization")
     parser.add_argument("--memory_aware", action="store_true", help="Enable memory-aware matching")
     parser.add_argument("--topk", action="store_true", help="Enable top-k matching")
+    parser.add_argument("--temporal_order", action="store_true", help="Enable ordered temporal consistency matching")
     parser.add_argument("--full", action="store_true", help="Enable full modified pipeline")
     parser.add_argument("--min_confidence", type=float, default=None)
     parser.add_argument("--min_detection_height", type=int, default=None)
@@ -481,6 +502,8 @@ def main():
         opt_argv.append("--memory_aware")
     if args.topk:
         opt_argv.append("--topk")
+    if args.temporal_order:
+        opt_argv.append("--temporal_order")
     if args.full:
         opt_argv.append("--full")
     sys.argv = opt_argv

@@ -63,6 +63,7 @@ def parse_args():
     parser.add_argument("--memory_init", action="store_true", help="Enable delayed long-memory initialization")
     parser.add_argument("--memory_aware", action="store_true", help="Enable memory-aware matching")
     parser.add_argument("--topk", action="store_true", help="Enable top-k matching")
+    parser.add_argument("--temporal_order", action="store_true", help="Enable ordered temporal consistency matching")
     parser.add_argument("--full", action="store_true", help="Enable the full modified pipeline")
 
     parser.add_argument("--ema", action="store_true", help="Enable EMA")
@@ -167,6 +168,8 @@ def run_strongsort(args, sequence_dir, detection_npy, result_txt):
             sys.argv.append("--memory_aware")
         if args.topk:
             sys.argv.append("--topk")
+        if args.temporal_order:
+            sys.argv.append("--temporal_order")
         if args.full:
             sys.argv.append("--full")
         import opts as opts_module

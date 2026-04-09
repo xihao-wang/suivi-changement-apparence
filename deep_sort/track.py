@@ -86,6 +86,9 @@ class Track:
         self.prot_short = None
         self.prot_long = None
         self.prototype = None
+        self.temporal_delta_1 = None
+        self.temporal_delta_2 = None
+        self.temporal_continuity = 0.0
         if feature is not None:
             if opt.enable_stm_ltm:
                 self.short_memory.append(feature)
@@ -106,6 +109,38 @@ class Track:
         self.kf = KalmanFilter()
 
         self.mean, self.covariance = self.kf.initiate(detection)
+
+    @staticmethod
+    def _normalize_vector(vec):
+        norm = np.linalg.norm(vec)
+        if norm < 1e-12:
+            return None
+        return vec / norm
+
+    def _update_temporal_state(self):
+        self.temporal_delta_1 = None
+        self.temporal_delta_2 = None
+        self.temporal_continuity = 0.0
+
+        if not opt.enable_temporal_order:
+            return
+
+        stride = max(1, int(opt.temporal_stride))
+        if len(self.short_memory) < 2 * stride + 1:
+            return
+
+        f_t = self.short_memory[-1]
+        f_t_i = self.short_memory[-1 - stride]
+        f_t_2i = self.short_memory[-1 - 2 * stride]
+
+        delta_1 = self._normalize_vector(f_t - f_t_i)
+        delta_2 = self._normalize_vector(f_t_i - f_t_2i)
+        if delta_1 is None or delta_2 is None:
+            return
+
+        self.temporal_delta_1 = delta_1
+        self.temporal_delta_2 = delta_2
+        self.temporal_continuity = float(np.clip(np.dot(delta_1, delta_2), -1.0, 1.0))
 
 
     def to_tlwh(self):
@@ -196,6 +231,7 @@ class Track:
 
         self.prot_short = np.mean(self.short_memory, axis=0)
         self.prot_short /= np.linalg.norm(self.prot_short)
+        self._update_temporal_state()
 
         self.hits += 1
 
