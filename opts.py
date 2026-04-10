@@ -144,11 +144,6 @@ class opts:
             help='Enable top-k aggregation for memory matching.'
         )
         self.parser.add_argument(
-            '--temporal_order',
-            action='store_true',
-            help='Enable ordered temporal consistency matching.'
-        )
-        self.parser.add_argument(
             '--full',
             action='store_true',
             help='Enable the full modified pipeline: STM/LTM + memory_init + memory_aware + topk.'
@@ -174,24 +169,17 @@ class opts:
         opt.k = 3 # Number of top distances to consider for k-top cosine distance(in nn_matching.py, _cosine_distance_to_memory function)
         opt.ambiguity_distance_threshold = 0.02
         opt.ambiguity_margin = 0.003
-        opt.temporal_stride = 2
-        opt.temporal_app_weight = 0.5
-        opt.temporal_order_weight = 0.3
-        opt.temporal_cont_weight = 0.2
-        opt.temporal_cost_weight = 0.05
         opt.enable_stm_ltm = False
         opt.enable_memory_init_control = False
         opt.enable_memory_matching = False
         opt.enable_topk_matching = False
-        opt.enable_temporal_order = False
 
         opt.enable_stm_ltm = (
-            opt.full or opt.ltm_stm or opt.memory_init or opt.memory_aware or opt.topk or opt.temporal_order
+            opt.full or opt.ltm_stm or opt.memory_init or opt.memory_aware or opt.topk
         )
         opt.enable_memory_init_control = opt.full or opt.memory_init
-        opt.enable_memory_matching = opt.full or opt.memory_aware or opt.topk or opt.temporal_order
+        opt.enable_memory_matching = opt.full or opt.memory_aware or opt.topk
         opt.enable_topk_matching = opt.full or opt.topk
-        opt.enable_temporal_order = opt.temporal_order
 
         
         if opt.BoT:

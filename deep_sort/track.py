@@ -87,9 +87,6 @@ class Track:
         self.prot_short = None
         self.prot_long = None
         self.prototype = None
-        self.temporal_delta_1 = None
-        self.temporal_delta_2 = None
-        self.temporal_continuity = 0.0
         if feature is not None:
             if opt.enable_stm_ltm:
                 self.short_memory.append(feature)
@@ -118,32 +115,6 @@ class Track:
         if norm < 1e-12:
             return None
         return vec / norm
-
-    def _update_temporal_state(self):
-        self.temporal_delta_1 = None
-        self.temporal_delta_2 = None
-        self.temporal_continuity = 0.0
-
-        if not opt.enable_temporal_order:
-            return
-
-        stride = max(1, int(opt.temporal_stride))
-        if len(self.prot_short_history) < 2 * stride + 1:
-            return
-
-        f_t = self.prot_short_history[-1]
-        f_t_i = self.prot_short_history[-1 - stride]
-        f_t_2i = self.prot_short_history[-1 - 2 * stride]
-
-        delta_1 = self._normalize_vector(f_t - f_t_i)
-        delta_2 = self._normalize_vector(f_t_i - f_t_2i)
-        if delta_1 is None or delta_2 is None:
-            return
-
-        self.temporal_delta_1 = delta_1
-        self.temporal_delta_2 = delta_2
-        self.temporal_continuity = float(np.clip(np.dot(delta_1, delta_2), -1.0, 1.0))
-
 
     def to_tlwh(self):
         """Get current position in bounding box format `(top left x, top left y,
@@ -234,10 +205,9 @@ class Track:
         self.prot_short = np.mean(self.short_memory, axis=0)
         self.prot_short /= np.linalg.norm(self.prot_short)
         self.prot_short_history.append(self.prot_short.copy())
-        prot_history_cap = max(opt.short_memory_size * 4, 2 * max(1, int(opt.temporal_stride)) + 1)
+        prot_history_cap = opt.short_memory_size * 4
         if len(self.prot_short_history) > prot_history_cap:
             self.prot_short_history.pop(0)
-        self._update_temporal_state()
 
         self.hits += 1
 

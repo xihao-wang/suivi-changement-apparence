@@ -1,0 +1,106 @@
+import torch
+import torch.nn as nn
+
+
+class TemporalAttentionScorer(nn.Module):
+    """A lightweight temporal scorer based on cross-attention.
+
+    Inputs
+    ------
+    det_feat:
+        Tensor of shape (B, F), the current detection feature.
+    hist_feat:
+        Tensor of shape (B, T, F), the ordered track history features.
+        A typical setting is T=3 with [p_t, p_{t-i}, p_{t-2i}].
+
+    Outputs
+    -------
+    score:
+        Tensor of shape (B,), a scalar matching score per pair.
+    attn:
+        Tensor of shape (B, num_heads, 1, T), attention weights for debugging.
+    """
+
+    def __init__(self, feature_dim, hidden_dim=256, num_heads=4, dropout=0.0):
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads")
+
+        self.feature_dim = feature_dim
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+
+        self.q_proj = nn.Linear(feature_dim, hidden_dim)
+        self.k_proj = nn.Linear(feature_dim, hidden_dim)
+        self.v_proj = nn.Linear(feature_dim, hidden_dim)
+
+        # Use batch_first so the module accepts (B, T, C).
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim + feature_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, det_feat, hist_feat, return_attention=True):
+        if det_feat.dim() != 2:
+            raise ValueError(
+                f"det_feat must have shape (B, F), got {tuple(det_feat.shape)}"
+            )
+        if hist_feat.dim() != 3:
+            raise ValueError(
+                f"hist_feat must have shape (B, T, F), got {tuple(hist_feat.shape)}"
+            )
+        if det_feat.size(0) != hist_feat.size(0):
+            raise ValueError("det_feat and hist_feat must share the same batch size")
+        if det_feat.size(-1) != self.feature_dim or hist_feat.size(-1) != self.feature_dim:
+            raise ValueError(
+                "feature dimension mismatch: "
+                f"expected {self.feature_dim}, got det={det_feat.size(-1)} "
+                f"hist={hist_feat.size(-1)}"
+            )
+
+        q = self.q_proj(det_feat).unsqueeze(1)  # (B, 1, H)
+        k = self.k_proj(hist_feat)              # (B, T, H)
+        v = self.v_proj(hist_feat)              # (B, T, H)
+
+        context, attn = self.attention(
+            q,
+            k,
+            v,
+            need_weights=return_attention,
+            average_attn_weights=False,
+        )
+        context = context.squeeze(1)  # (B, H)
+
+        fused = torch.cat([det_feat, context], dim=-1)  # (B, F + H)
+        score = self.mlp(fused).squeeze(-1)             # (B,)
+
+        if return_attention:
+            return score, attn
+        return score
+
+
+def build_temporal_input(det_feat, p_t, p_t_i, p_t_2i):
+    """Build the ordered temporal input tensor.
+
+    Parameters
+    ----------
+    det_feat : Tensor, shape (B, F)
+    p_t : Tensor, shape (B, F)
+    p_t_i : Tensor, shape (B, F)
+    p_t_2i : Tensor, shape (B, F)
+
+    Returns
+    -------
+    hist_feat : Tensor, shape (B, 3, F)
+    """
+    if not (det_feat.dim() == p_t.dim() == p_t_i.dim() == p_t_2i.dim() == 2):
+        raise ValueError("all input features must have shape (B, F)")
+    return torch.stack([p_t, p_t_i, p_t_2i], dim=1)

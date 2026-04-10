@@ -12,6 +12,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+import torch
 import tkinter as tk
 from PIL import Image, ImageTk
 from tkinter import font as tkfont
@@ -35,10 +36,10 @@ class FrameReport:
     detections: list[dict[str, Any]]
     tracks: list[dict[str, Any]]
     appearance_cost_matrix: list[list[float]]
-    temporal_cost_matrix: list[list[float]]
-    temporal_s1_matrix: list[list[float]]
-    temporal_s2_matrix: list[list[float]]
-    temporal_c_matrix: list[list[float]]
+    learned_temporal_score_matrix: list[list[float]]
+    learned_attn_pt_matrix: list[list[float]]
+    learned_attn_ti_matrix: list[list[float]]
+    learned_attn_t2i_matrix: list[list[float]]
     final_cost_matrix: list[list[float]]
     raw_cost_matrix: list[list[float]]
     gated_cost_matrix: list[list[float]]
@@ -61,9 +62,15 @@ def build_reports(
     min_detection_height: int,
     max_cosine_distance: float,
     nn_budget: int | None,
+    enable_learned_temporal: bool = False,
+    temporal_model_ckpt: str | None = None,
+    temporal_hidden_dim: int = 256,
+    temporal_num_heads: int = 4,
+    temporal_stride: int = 2,
 ) -> tuple[list[FrameReport], int, int]:
     from application_util import preprocessing
     from deep_sort import linear_assignment, nn_matching
+    from deep_sort.temporal_model import TemporalAttentionScorer
     from deep_sort.tracker import Tracker
     from deep_sort_app import create_detections, gather_sequence_info
     from opts import opt
@@ -73,6 +80,19 @@ def build_reports(
         "cosine", max_cosine_distance, nn_budget
     )
     tracker = Tracker(metric)
+    learned_temporal_model = None
+    if enable_learned_temporal:
+        feature_dim = seq_info["detections"].shape[1] - 10
+        learned_temporal_model = TemporalAttentionScorer(
+            feature_dim=feature_dim,
+            hidden_dim=temporal_hidden_dim,
+            num_heads=temporal_num_heads,
+        )
+        if temporal_model_ckpt:
+            ckpt = torch.load(temporal_model_ckpt, map_location="cpu")
+            state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+            learned_temporal_model.load_state_dict(state_dict, strict=False)
+        learned_temporal_model.eval()
 
     reports: list[FrameReport] = []
     min_frame = seq_info["min_frame_idx"]
@@ -102,7 +122,7 @@ def build_reports(
         features = np.array([detections[i].feature for i in detection_indices])
 
         if len(candidate_tracks) > 0 and len(detections) > 0:
-            appearance_cost, temporal_cost, temporal_s1, temporal_s2, temporal_c, final_cost = \
+            appearance_cost, final_cost = \
                 tracker.metric.distance_components_with_memory(features, candidate_tracks)
             raw_cost = final_cost
             gated_cost = linear_assignment.gate_cost_matrix(
@@ -112,12 +132,25 @@ def build_reports(
                 confirmed_track_indices,
                 detection_indices,
             )
+            if enable_learned_temporal:
+                learned_score, learned_attn_pt, learned_attn_ti, learned_attn_t2i = \
+                    _compute_learned_temporal_matrices(
+                        candidate_tracks,
+                        detections,
+                        learned_temporal_model,
+                        stride=max(1, int(temporal_stride)),
+                    )
+            else:
+                learned_score = np.zeros((len(candidate_tracks), len(detections)))
+                learned_attn_pt = np.zeros((len(candidate_tracks), len(detections)))
+                learned_attn_ti = np.zeros((len(candidate_tracks), len(detections)))
+                learned_attn_t2i = np.zeros((len(candidate_tracks), len(detections)))
         else:
             appearance_cost = np.zeros((len(candidate_tracks), len(detections)))
-            temporal_cost = np.zeros((len(candidate_tracks), len(detections)))
-            temporal_s1 = np.zeros((len(candidate_tracks), len(detections)))
-            temporal_s2 = np.zeros((len(candidate_tracks), len(detections)))
-            temporal_c = np.zeros((len(candidate_tracks), len(detections)))
+            learned_score = np.zeros((len(candidate_tracks), len(detections)))
+            learned_attn_pt = np.zeros((len(candidate_tracks), len(detections)))
+            learned_attn_ti = np.zeros((len(candidate_tracks), len(detections)))
+            learned_attn_t2i = np.zeros((len(candidate_tracks), len(detections)))
             final_cost = np.zeros((len(candidate_tracks), len(detections)))
             raw_cost = np.zeros((len(candidate_tracks), len(detections)))
             gated_cost = raw_cost.copy()
@@ -146,10 +179,10 @@ def build_reports(
                 for track in candidate_tracks
             ],
             appearance_cost_matrix=appearance_cost.tolist(),
-            temporal_cost_matrix=temporal_cost.tolist(),
-            temporal_s1_matrix=temporal_s1.tolist(),
-            temporal_s2_matrix=temporal_s2.tolist(),
-            temporal_c_matrix=temporal_c.tolist(),
+            learned_temporal_score_matrix=learned_score.tolist(),
+            learned_attn_pt_matrix=learned_attn_pt.tolist(),
+            learned_attn_ti_matrix=learned_attn_ti.tolist(),
+            learned_attn_t2i_matrix=learned_attn_t2i.tolist(),
             final_cost_matrix=final_cost.tolist(),
             raw_cost_matrix=raw_cost.tolist(),
             gated_cost_matrix=gated_cost.tolist(),
@@ -189,6 +222,54 @@ def build_reports(
         )
 
     return reports, min_frame, max_frame
+
+
+def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stride):
+    num_tracks = len(candidate_tracks)
+    num_dets = len(detections)
+    score_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
+    attn_pt_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
+    attn_ti_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
+    attn_t2i_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
+
+    det_batch = []
+    hist_batch = []
+    pair_indices = []
+
+    for i, track in enumerate(candidate_tracks):
+        if len(getattr(track, "prot_short_history", [])) < 2 * stride + 1:
+            continue
+        p_t = np.asarray(track.prot_short_history[-1], dtype=np.float32)
+        p_t_i = np.asarray(track.prot_short_history[-1 - stride], dtype=np.float32)
+        p_t_2i = np.asarray(track.prot_short_history[-1 - 2 * stride], dtype=np.float32)
+        for j, det in enumerate(detections):
+            det_feat = np.asarray(det.feature, dtype=np.float32)
+            det_norm = np.linalg.norm(det_feat)
+            if det_norm > 1e-12:
+                det_feat = det_feat / det_norm
+            det_batch.append(det_feat)
+            hist_batch.append(np.stack([p_t, p_t_i, p_t_2i], axis=0))
+            pair_indices.append((i, j))
+
+    if not pair_indices:
+        return score_matrix, attn_pt_matrix, attn_ti_matrix, attn_t2i_matrix
+
+    det_tensor = torch.from_numpy(np.stack(det_batch, axis=0))
+    hist_tensor = torch.from_numpy(np.stack(hist_batch, axis=0))
+
+    with torch.no_grad():
+        score_tensor, attn_tensor = model(det_tensor, hist_tensor, return_attention=True)
+
+    scores = score_tensor.detach().cpu().numpy()
+    attn = attn_tensor.detach().cpu().numpy().mean(axis=1).squeeze(1)  # (B, 3)
+
+    for idx, (i, j) in enumerate(pair_indices):
+        score_matrix[i, j] = float(scores[idx])
+        attn_pt_matrix[i, j] = float(attn[idx, 0])
+        attn_ti_matrix[i, j] = float(attn[idx, 1])
+        attn_t2i_matrix[i, j] = float(attn[idx, 2])
+
+    return score_matrix, attn_pt_matrix, attn_ti_matrix, attn_t2i_matrix
 
 
 class MatchViewerApp:
@@ -422,14 +503,14 @@ class MatchViewerApp:
 
         self.matrix_text.insert(tk.END, "Appearance cost matrix\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.appearance_cost_matrix, report))
-        self.matrix_text.insert(tk.END, "\nTemporal order cost matrix\n")
-        self.matrix_text.insert(tk.END, self.format_matrix(report.temporal_cost_matrix, report))
-        self.matrix_text.insert(tk.END, "\nTemporal s1 matrix\n")
-        self.matrix_text.insert(tk.END, self.format_matrix(report.temporal_s1_matrix, report))
-        self.matrix_text.insert(tk.END, "\nTemporal s2 matrix\n")
-        self.matrix_text.insert(tk.END, self.format_matrix(report.temporal_s2_matrix, report))
-        self.matrix_text.insert(tk.END, "\nTemporal c matrix\n")
-        self.matrix_text.insert(tk.END, self.format_matrix(report.temporal_c_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned temporal score matrix\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_temporal_score_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned attention on p_t\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_pt_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned attention on p_t-i\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_ti_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned attention on p_t-2i\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_t2i_matrix, report))
         self.matrix_text.insert(tk.END, "\nFinal cost matrix(before gating)\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.final_cost_matrix, report))
         self.matrix_text.insert(tk.END, "\nGated distance matrix(motion / Kalman gating)\n")
@@ -469,8 +550,12 @@ def parse_args():
     parser.add_argument("--memory_init", action="store_true", help="Enable delayed long-memory initialization")
     parser.add_argument("--memory_aware", action="store_true", help="Enable memory-aware matching")
     parser.add_argument("--topk", action="store_true", help="Enable top-k matching")
-    parser.add_argument("--temporal_order", action="store_true", help="Enable ordered temporal consistency matching")
     parser.add_argument("--full", action="store_true", help="Enable full modified pipeline")
+    parser.add_argument("--learned_temporal", action="store_true", help="Show learned temporal score matrix using TemporalAttentionScorer")
+    parser.add_argument("--temporal_model_ckpt", type=str, default=None, help="Optional checkpoint path for the learned temporal scorer")
+    parser.add_argument("--temporal_hidden_dim", type=int, default=256, help="Hidden dimension for the learned temporal scorer")
+    parser.add_argument("--temporal_num_heads", type=int, default=4, help="Number of attention heads for the learned temporal scorer")
+    parser.add_argument("--learned_temporal_stride", type=int, default=2, help="Temporal stride used to sample [p_t, p_t-i, p_t-2i] for the learned temporal scorer")
     parser.add_argument("--min_confidence", type=float, default=None)
     parser.add_argument("--min_detection_height", type=int, default=None)
     parser.add_argument("--nms_max_overlap", type=float, default=None)
@@ -502,8 +587,6 @@ def main():
         opt_argv.append("--memory_aware")
     if args.topk:
         opt_argv.append("--topk")
-    if args.temporal_order:
-        opt_argv.append("--temporal_order")
     if args.full:
         opt_argv.append("--full")
     sys.argv = opt_argv
@@ -527,6 +610,11 @@ def main():
         min_detection_height=min_detection_height,
         max_cosine_distance=max_cosine_distance,
         nn_budget=nn_budget,
+        enable_learned_temporal=args.learned_temporal,
+        temporal_model_ckpt=args.temporal_model_ckpt,
+        temporal_hidden_dim=args.temporal_hidden_dim,
+        temporal_num_heads=args.temporal_num_heads,
+        temporal_stride=args.learned_temporal_stride,
     )
     print(f"Loaded {len(reports)} frames.")
     root = tk.Tk()

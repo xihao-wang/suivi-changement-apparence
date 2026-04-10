@@ -210,42 +210,6 @@ class NearestNeighborDistanceMetric(object):
         feat = np.asarray(feature, dtype=np.float32).reshape(1, -1)
         return float(_cosine_distance(ref, feat).reshape(-1)[0])
 
-    def _temporal_order_cost(self, feature, track):
-        temporal_cost, _, _, _ = self._temporal_order_components(feature, track)
-        return temporal_cost
-
-    def _temporal_order_components(self, feature, track):
-        if (
-            not opt.enable_temporal_order
-            or track.prot_short is None
-            or track.temporal_delta_1 is None
-            or track.temporal_delta_2 is None
-        ):
-            return 1.0, 0.0, 0.0, 0.0
-
-        delta_now = _normalize_vector(
-            np.asarray(feature, dtype=np.float32) - np.asarray(track.prot_short, dtype=np.float32)
-        )
-        if delta_now is None:
-            return 1.0, 0.0, 0.0, 0.0
-
-        s1 = float(np.clip(np.dot(delta_now, track.temporal_delta_1), -1.0, 1.0))
-        s2 = float(np.clip(np.dot(delta_now, track.temporal_delta_2), -1.0, 1.0))
-        continuity_now = _normalize_vector(delta_now - track.temporal_delta_1)
-        continuity_hist = _normalize_vector(track.temporal_delta_1 - track.temporal_delta_2)
-        if continuity_now is None or continuity_hist is None:
-            c = 0.0
-        else:
-            c = float(np.clip(np.dot(continuity_now, continuity_hist), -1.0, 1.0))
-
-        score_temp = (
-            opt.temporal_app_weight * s1
-            + opt.temporal_order_weight * (s1 - s2)
-        )
-        score_temp = float(np.clip(score_temp, -1.0, 1.0))
-        temporal_cost = (1.0 - score_temp) / 2.0
-        return temporal_cost, s1, s2, c
-
     def distance_with_memory(self, features, tracks):
         cost_matrix = np.zeros((len(tracks), len(features)))
         for i, track in enumerate(tracks):
@@ -257,24 +221,13 @@ class NearestNeighborDistanceMetric(object):
                     opt.short_distance_weight * d_short
                     + (1 - opt.short_distance_weight) * d_long
                 )
-                if opt.enable_temporal_order:
-                    temporal_cost = self._temporal_order_cost(feature, track)
-                    final_cost = (
-                        (1 - opt.temporal_cost_weight) * appearance_cost
-                        + opt.temporal_cost_weight * temporal_cost
-                    )
-                else:
-                    final_cost = appearance_cost
+                final_cost = appearance_cost
                 cost_matrix[i, j] = final_cost
         return cost_matrix
 
     def distance_components_with_memory(self, features, tracks):
-        """Return appearance, temporal, temporal components and final cost matrices."""
+        """Return appearance and final cost matrices for debug viewer."""
         appearance_matrix = np.zeros((len(tracks), len(features)))
-        temporal_matrix = np.zeros((len(tracks), len(features)))
-        s1_matrix = np.zeros((len(tracks), len(features)))
-        s2_matrix = np.zeros((len(tracks), len(features)))
-        c_matrix = np.zeros((len(tracks), len(features)))
         final_matrix = np.zeros((len(tracks), len(features)))
 
         for i, track in enumerate(tracks):
@@ -286,24 +239,9 @@ class NearestNeighborDistanceMetric(object):
                     opt.short_distance_weight * d_short
                     + (1 - opt.short_distance_weight) * d_long
                 )
-                if opt.enable_temporal_order:
-                    temporal_cost, s1, s2, c = self._temporal_order_components(feature, track)
-                    final_cost = (
-                        (1 - opt.temporal_cost_weight) * appearance_cost
-                        + opt.temporal_cost_weight * temporal_cost
-                    )
-                else:
-                    temporal_cost = 1.0
-                    s1 = 0.0
-                    s2 = 0.0
-                    c = 0.0
-                    final_cost = appearance_cost
+                final_cost = appearance_cost
 
                 appearance_matrix[i, j] = appearance_cost
-                temporal_matrix[i, j] = temporal_cost
-                s1_matrix[i, j] = s1
-                s2_matrix[i, j] = s2
-                c_matrix[i, j] = c
                 final_matrix[i, j] = final_cost
 
-        return appearance_matrix, temporal_matrix, s1_matrix, s2_matrix, c_matrix, final_matrix
+        return appearance_matrix, final_matrix
