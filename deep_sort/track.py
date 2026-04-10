@@ -82,6 +82,7 @@ class Track:
 
         # Memory-based identity representation.
         self.short_memory = []
+        self.prot_short_history = []
         self.long_memory = []
         self.prot_short = None
         self.prot_long = None
@@ -93,6 +94,7 @@ class Track:
             if opt.enable_stm_ltm:
                 self.short_memory.append(feature)
                 self.prot_short = feature.copy()
+                self.prot_short_history.append(self.prot_short.copy())
                 self.prot_long = None
                 self.prototype = feature.copy()
                 self.features = [self.prototype.copy()]
@@ -126,12 +128,12 @@ class Track:
             return
 
         stride = max(1, int(opt.temporal_stride))
-        if len(self.short_memory) < 2 * stride + 1:
+        if len(self.prot_short_history) < 2 * stride + 1:
             return
 
-        f_t = self.short_memory[-1]
-        f_t_i = self.short_memory[-1 - stride]
-        f_t_2i = self.short_memory[-1 - 2 * stride]
+        f_t = self.prot_short_history[-1]
+        f_t_i = self.prot_short_history[-1 - stride]
+        f_t_2i = self.prot_short_history[-1 - 2 * stride]
 
         delta_1 = self._normalize_vector(f_t - f_t_i)
         delta_2 = self._normalize_vector(f_t_i - f_t_2i)
@@ -231,6 +233,10 @@ class Track:
 
         self.prot_short = np.mean(self.short_memory, axis=0)
         self.prot_short /= np.linalg.norm(self.prot_short)
+        self.prot_short_history.append(self.prot_short.copy())
+        prot_history_cap = max(opt.short_memory_size * 4, 2 * max(1, int(opt.temporal_stride)) + 1)
+        if len(self.prot_short_history) > prot_history_cap:
+            self.prot_short_history.pop(0)
         self._update_temporal_state()
 
         self.hits += 1
