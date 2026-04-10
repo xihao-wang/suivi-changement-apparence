@@ -34,6 +34,8 @@ class TemporalAttentionScorer(nn.Module):
         self.k_proj = nn.Linear(feature_dim, hidden_dim)
         self.v_proj = nn.Linear(feature_dim, hidden_dim)
 
+        self.hist_pos_embed = nn.Parameter(torch.randn(1, 3, hidden_dim)*0.02)  
+
         # Use batch_first so the module accepts (B, T, C).
         self.attention = nn.MultiheadAttention(
             embed_dim=hidden_dim,
@@ -43,7 +45,7 @@ class TemporalAttentionScorer(nn.Module):
         )
 
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim + feature_dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
         )
@@ -67,8 +69,8 @@ class TemporalAttentionScorer(nn.Module):
             )
 
         q = self.q_proj(det_feat).unsqueeze(1)  # (B, 1, H)
-        k = self.k_proj(hist_feat)              # (B, T, H)
-        v = self.v_proj(hist_feat)              # (B, T, H)
+        k = self.k_proj(hist_feat) + self.hist_pos_embed[:, :hist_feat.size(1), :]
+        v = self.v_proj(hist_feat) + self.hist_pos_embed[:, :hist_feat.size(1), :]
 
         context, attn = self.attention(
             q,
@@ -79,8 +81,9 @@ class TemporalAttentionScorer(nn.Module):
         )
         context = context.squeeze(1)  # (B, H)
 
-        fused = torch.cat([det_feat, context], dim=-1)  # (B, F + H)
-        score = self.mlp(fused).squeeze(-1)             # (B,)
+        # fused = torch.cat([det_feat, context], dim=-1)  # (B, F + H)
+        # score = self.mlp(fused).squeeze(-1)             # (B,)
+        score = self.mlp(context).squeeze(-1)           # (B,)
 
         if return_attention:
             return score, attn
