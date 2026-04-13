@@ -36,7 +36,7 @@ class TemporalAttentionScorer(nn.Module):
         self.q_norm = nn.LayerNorm(hidden_dim)
         self.k_norm = nn.LayerNorm(hidden_dim)
 
-        self.hist_pos_embed = nn.Parameter(torch.randn(1, 3, hidden_dim)*0.02)  
+        self.hist_pos_embed = nn.Parameter(torch.randn(1, 2, hidden_dim) * 0.02)
 
         # Use batch_first so the module accepts (B, T, C).
         self.attention = nn.MultiheadAttention(
@@ -76,7 +76,7 @@ class TemporalAttentionScorer(nn.Module):
             )
 
         #   query  = delta_now = det_feat - p_t
-        #   tokens = [p_t, delta_1, delta_2]
+        #   tokens = [delta_1, delta_2]
         p_t = hist_feat[:, 0, :]
         p_t_i = hist_feat[:, 1, :]
         p_t_2i = hist_feat[:, 2, :]
@@ -85,7 +85,7 @@ class TemporalAttentionScorer(nn.Module):
         delta_1 = p_t - p_t_i
         delta_2 = p_t_i - p_t_2i
 
-        temporal_tokens = torch.stack([p_t, delta_1, delta_2], dim=1)  # (B, 3, F)
+        temporal_tokens = torch.stack([delta_1, delta_2], dim=1)  # (B, 2, F)
 
         q = self.q_norm(self.q_proj(delta_now)).unsqueeze(1)  # (B, 1, H)
 

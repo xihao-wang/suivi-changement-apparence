@@ -261,13 +261,12 @@ def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stri
         score_tensor, attn_tensor = model(det_tensor, hist_tensor, return_attention=True)
 
     scores = score_tensor.detach().cpu().numpy()
-    attn = attn_tensor.detach().cpu().numpy().mean(axis=1).squeeze(1)  # (B, 3)
+    attn = attn_tensor.detach().cpu().numpy().mean(axis=1).squeeze(1)  # (B, 2)
 
     for idx, (i, j) in enumerate(pair_indices):
         score_matrix[i, j] = float(scores[idx])
         attn_pt_matrix[i, j] = float(attn[idx, 0])
         attn_ti_matrix[i, j] = float(attn[idx, 1])
-        attn_t2i_matrix[i, j] = float(attn[idx, 2])
 
     return score_matrix, attn_pt_matrix, attn_ti_matrix, attn_t2i_matrix
 
@@ -511,12 +510,10 @@ class MatchViewerApp:
                 report,
             ),
         )
-        self.matrix_text.insert(tk.END, "\nLearned attention on p_t\n")
+        self.matrix_text.insert(tk.END, "\nLearned attention on Delta_1 (p_t - p_t-i)\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_pt_matrix, report))
-        self.matrix_text.insert(tk.END, "\nLearned attention on p_t-i\n")
+        self.matrix_text.insert(tk.END, "\nLearned attention on Delta_2 (p_t-i - p_t-2i)\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_ti_matrix, report))
-        self.matrix_text.insert(tk.END, "\nLearned attention on p_t-2i\n")
-        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_t2i_matrix, report))
         self.matrix_text.insert(tk.END, "\nFinal cost matrix(before gating)\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.final_cost_matrix, report))
         self.matrix_text.insert(tk.END, "\nGated distance matrix(motion / Kalman gating)\n")
