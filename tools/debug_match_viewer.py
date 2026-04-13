@@ -503,8 +503,14 @@ class MatchViewerApp:
 
         self.matrix_text.insert(tk.END, "Appearance cost matrix\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.appearance_cost_matrix, report))
-        self.matrix_text.insert(tk.END, "\nLearned temporal score matrix\n")
-        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_temporal_score_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned temporal score matrix (sigmoid)\n")
+        self.matrix_text.insert(
+            tk.END,
+            self.format_matrix(
+                self._sigmoid_matrix(report.learned_temporal_score_matrix),
+                report,
+            ),
+        )
         self.matrix_text.insert(tk.END, "\nLearned attention on p_t\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_pt_matrix, report))
         self.matrix_text.insert(tk.END, "\nLearned attention on p_t-i\n")
@@ -515,6 +521,12 @@ class MatchViewerApp:
         self.matrix_text.insert(tk.END, self.format_matrix(report.final_cost_matrix, report))
         self.matrix_text.insert(tk.END, "\nGated distance matrix(motion / Kalman gating)\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.gated_cost_matrix, report))
+
+    @staticmethod
+    def _sigmoid_matrix(matrix: list[list[float]]) -> list[list[float]]:
+        arr = np.asarray(matrix, dtype=np.float64)
+        arr = 1.0 / (1.0 + np.exp(-arr))
+        return arr.tolist()
 
     def format_matrix(self, matrix: list[list[float]], report: FrameReport) -> str:
         if not report.tracks or not report.detections:

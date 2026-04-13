@@ -33,6 +33,8 @@ class TemporalAttentionScorer(nn.Module):
         self.q_proj = nn.Linear(feature_dim, hidden_dim)
         self.k_proj = nn.Linear(feature_dim, hidden_dim)
         self.v_proj = nn.Linear(feature_dim, hidden_dim)
+        self.q_norm = nn.LayerNorm(hidden_dim)
+        self.k_norm = nn.LayerNorm(hidden_dim)
 
         self.hist_pos_embed = nn.Parameter(torch.randn(1, 3, hidden_dim)*0.02)  
 
@@ -68,9 +70,29 @@ class TemporalAttentionScorer(nn.Module):
                 f"hist={hist_feat.size(-1)}"
             )
 
-        q = self.q_proj(det_feat).unsqueeze(1)  # (B, 1, H)
-        k = self.k_proj(hist_feat) + self.hist_pos_embed[:, :hist_feat.size(1), :]
-        v = self.v_proj(hist_feat) + self.hist_pos_embed[:, :hist_feat.size(1), :]
+        if hist_feat.size(1) < 3:
+            raise ValueError(
+                f"hist_feat must have at least 3 ordered states, got {hist_feat.size(1)}"
+            )
+
+        #   query  = delta_now = det_feat - p_t
+        #   tokens = [p_t, delta_1, delta_2]
+        p_t = hist_feat[:, 0, :]
+        p_t_i = hist_feat[:, 1, :]
+        p_t_2i = hist_feat[:, 2, :]
+
+        delta_now = det_feat - p_t
+        delta_1 = p_t - p_t_i
+        delta_2 = p_t_i - p_t_2i
+
+        temporal_tokens = torch.stack([p_t, delta_1, delta_2], dim=1)  # (B, 3, F)
+
+        q = self.q_norm(self.q_proj(delta_now)).unsqueeze(1)  # (B, 1, H)
+
+        k = self.k_norm(
+            self.k_proj(temporal_tokens) + self.hist_pos_embed[:, :temporal_tokens.size(1), :]
+        )
+        v = self.v_proj(temporal_tokens) + self.hist_pos_embed[:, :temporal_tokens.size(1), :]
 
         context, attn = self.attention(
             q,
