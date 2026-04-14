@@ -183,6 +183,32 @@ def main():
         candidate_tracks = [t for t in tracker.tracks if t.is_confirmed()]
         result_rows = result_by_frame.get(frame_idx, [])
         det_target_ids = infer_detection_target_ids(detections, result_rows, args.iou_threshold)
+        valid_target_ids = {target_id for target_id in det_target_ids if target_id is not None}
+
+        # Skip frames where only one identity is available. These frames mostly
+        # contribute positives and do not provide useful contrastive supervision
+        # for pair construction.
+        if len(valid_target_ids) <= 1:
+            matches, unmatched_tracks, unmatched_detections = tracker._match(detections)
+            for track_idx, detection_idx in matches:
+                tracker.tracks[track_idx].update(detections[detection_idx])
+            for track_idx in unmatched_tracks:
+                tracker.tracks[track_idx].mark_missed()
+            for detection_idx in unmatched_detections:
+                tracker._initiate_track(detections[detection_idx])
+            tracker.tracks = [t for t in tracker.tracks if not t.is_deleted()]
+
+            active_targets = [t.track_id for t in tracker.tracks if t.is_confirmed()]
+            feat_list, target_list = [], []
+            for track in tracker.tracks:
+                if not track.is_confirmed():
+                    continue
+                feat_list += track.features
+                target_list += [track.track_id for _ in track.features]
+                if not opt.EMA:
+                    track.features = []
+            tracker.metric.partial_fit(np.asarray(feat_list), np.asarray(target_list), active_targets)
+            continue
 
         for track in candidate_tracks:
             history = getattr(track, "prot_short_history", [])
