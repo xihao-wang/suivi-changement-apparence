@@ -83,11 +83,13 @@ class Track:
         # Memory-based identity representation.
         self.short_memory = []
         self.prot_short_history = []
+        self.det_feat_history = []
         self.long_memory = []
         self.prot_short = None
         self.prot_long = None
         self.prototype = None
         if feature is not None:
+            self.det_feat_history.append(feature.copy())
             if opt.enable_stm_ltm:
                 self.short_memory.append(feature)
                 self.prot_short = feature.copy()
@@ -198,6 +200,11 @@ class Track:
             return
 
         # Update short-term memory with the latest raw observation.
+        self.det_feat_history.append(feature.copy())
+        det_history_cap = opt.long_memory_size
+        if len(self.det_feat_history) > det_history_cap:
+            self.det_feat_history.pop(0)
+
         self.short_memory.append(feature)
         if len(self.short_memory) > opt.short_memory_size:
             self.short_memory.pop(0)
@@ -205,7 +212,7 @@ class Track:
         self.prot_short = np.mean(self.short_memory, axis=0)
         self.prot_short /= np.linalg.norm(self.prot_short)
         self.prot_short_history.append(self.prot_short.copy())
-        prot_history_cap = opt.short_memory_size * 4
+        prot_history_cap = opt.long_memory_size
         if len(self.prot_short_history) > prot_history_cap:
             self.prot_short_history.pop(0)
 

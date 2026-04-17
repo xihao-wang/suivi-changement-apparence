@@ -23,9 +23,9 @@ class TemporalPairDataset(Dataset):
     def __init__(self, npz_path: str):
         data = np.load(npz_path)
         self.det_feat = data["det_feat"].astype(np.float32)
-        self.p_t = data["p_t"].astype(np.float32)
-        self.p_t_i = data["p_t_i"].astype(np.float32)
-        self.p_t_2i = data["p_t_2i"].astype(np.float32)
+        self.df_t = data["df_t"].astype(np.float32) if "df_t" in data else data["p_t"].astype(np.float32)
+        self.df_t_i = data["df_t_i"].astype(np.float32) if "df_t_i" in data else data["p_t_i"].astype(np.float32)
+        self.df_t_2i = data["df_t_2i"].astype(np.float32) if "df_t_2i" in data else data["p_t_2i"].astype(np.float32)
         self.label = data["label"].astype(np.float32)
 
     def __len__(self):
@@ -33,7 +33,7 @@ class TemporalPairDataset(Dataset):
 
     def __getitem__(self, idx):
         det = torch.from_numpy(self.det_feat[idx])
-        hist = torch.from_numpy(np.stack([self.p_t[idx], self.p_t_i[idx], self.p_t_2i[idx]], axis=0))
+        hist = torch.from_numpy(np.stack([self.df_t[idx], self.df_t_i[idx], self.df_t_2i[idx]], axis=0))
         label = torch.tensor(self.label[idx], dtype=torch.float32)
         return det, hist, label
 
@@ -44,18 +44,18 @@ class MultiTemporalPairDataset(Dataset):
             raise ValueError("npz_paths must not be empty")
 
         det_feats = []
-        p_ts = []
-        p_t_is = []
-        p_t_2is = []
+        df_ts = []
+        df_t_is = []
+        df_t_2is = []
         labels = []
         feature_dim = None
 
         for npz_path in npz_paths:
             data = np.load(npz_path)
             det_feat = data["det_feat"].astype(np.float32)
-            p_t = data["p_t"].astype(np.float32)
-            p_t_i = data["p_t_i"].astype(np.float32)
-            p_t_2i = data["p_t_2i"].astype(np.float32)
+            df_t = data["df_t"].astype(np.float32) if "df_t" in data else data["p_t"].astype(np.float32)
+            df_t_i = data["df_t_i"].astype(np.float32) if "df_t_i" in data else data["p_t_i"].astype(np.float32)
+            df_t_2i = data["df_t_2i"].astype(np.float32) if "df_t_2i" in data else data["p_t_2i"].astype(np.float32)
             label = data["label"].astype(np.float32)
 
             if feature_dim is None:
@@ -66,15 +66,15 @@ class MultiTemporalPairDataset(Dataset):
                 )
 
             det_feats.append(det_feat)
-            p_ts.append(p_t)
-            p_t_is.append(p_t_i)
-            p_t_2is.append(p_t_2i)
+            df_ts.append(df_t)
+            df_t_is.append(df_t_i)
+            df_t_2is.append(df_t_2i)
             labels.append(label)
 
         self.det_feat = np.concatenate(det_feats, axis=0)
-        self.p_t = np.concatenate(p_ts, axis=0)
-        self.p_t_i = np.concatenate(p_t_is, axis=0)
-        self.p_t_2i = np.concatenate(p_t_2is, axis=0)
+        self.df_t = np.concatenate(df_ts, axis=0)
+        self.df_t_i = np.concatenate(df_t_is, axis=0)
+        self.df_t_2i = np.concatenate(df_t_2is, axis=0)
         self.label = np.concatenate(labels, axis=0)
 
     def __len__(self):
@@ -82,7 +82,7 @@ class MultiTemporalPairDataset(Dataset):
 
     def __getitem__(self, idx):
         det = torch.from_numpy(self.det_feat[idx])
-        hist = torch.from_numpy(np.stack([self.p_t[idx], self.p_t_i[idx], self.p_t_2i[idx]], axis=0))
+        hist = torch.from_numpy(np.stack([self.df_t[idx], self.df_t_i[idx], self.df_t_2i[idx]], axis=0))
         label = torch.tensor(self.label[idx], dtype=torch.float32)
         return det, hist, label
 

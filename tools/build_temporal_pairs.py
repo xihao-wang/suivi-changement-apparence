@@ -3,9 +3,9 @@
 
 Each sample contains:
   - det_feat
-  - p_t
-  - p_t_i
-  - p_t_2i
+  - df_t
+  - df_t_i
+  - df_t_2i
   - label
 
 Pseudo labels are derived from a tracking result txt by matching detections
@@ -154,9 +154,9 @@ def main():
     tracker = Tracker(metric)
 
     det_feat_list = []
-    p_t_list = []
-    p_t_i_list = []
-    p_t_2i_list = []
+    df_t_list = []
+    df_t_i_list = []
+    df_t_2i_list = []
     label_list = []
     frame_list = []
     track_id_list = []
@@ -211,13 +211,13 @@ def main():
             continue
 
         for track in candidate_tracks:
-            history = getattr(track, "prot_short_history", [])
+            history = getattr(track, "det_feat_history", [])
             if len(history) < 2 * stride + 1:
                 continue
 
-            p_t = np.asarray(history[-1], dtype=np.float32)
-            p_t_i = np.asarray(history[-1 - stride], dtype=np.float32)
-            p_t_2i = np.asarray(history[-1 - 2 * stride], dtype=np.float32)
+            df_t = np.asarray(history[-1], dtype=np.float32)
+            df_t_i = np.asarray(history[-1 - stride], dtype=np.float32)
+            df_t_2i = np.asarray(history[-1 - 2 * stride], dtype=np.float32)
 
             positive_det_indices = [
                 det_idx for det_idx, target_id in enumerate(det_target_ids)
@@ -239,9 +239,9 @@ def main():
                     det_feat = det_feat / det_norm
 
                 det_feat_list.append(det_feat)
-                p_t_list.append(p_t)
-                p_t_i_list.append(p_t_i)
-                p_t_2i_list.append(p_t_2i)
+                df_t_list.append(df_t)
+                df_t_i_list.append(df_t_i)
+                df_t_2i_list.append(df_t_2i)
                 label_list.append(1.0 if det_target_ids[det_idx] == track.track_id else 0.0)
                 frame_list.append(frame_idx)
                 track_id_list.append(track.track_id)
@@ -272,9 +272,9 @@ def main():
     np.savez_compressed(
         output_path,
         det_feat=np.asarray(det_feat_list, dtype=np.float32),
-        p_t=np.asarray(p_t_list, dtype=np.float32),
-        p_t_i=np.asarray(p_t_i_list, dtype=np.float32),
-        p_t_2i=np.asarray(p_t_2i_list, dtype=np.float32),
+        df_t=np.asarray(df_t_list, dtype=np.float32),
+        df_t_i=np.asarray(df_t_i_list, dtype=np.float32),
+        df_t_2i=np.asarray(df_t_2i_list, dtype=np.float32),
         label=np.asarray(label_list, dtype=np.float32),
         frame=np.asarray(frame_list, dtype=np.int32),
         track_id=np.asarray(track_id_list, dtype=np.int32),

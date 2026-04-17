@@ -37,9 +37,9 @@ class FrameReport:
     tracks: list[dict[str, Any]]
     appearance_cost_matrix: list[list[float]]
     learned_temporal_score_matrix: list[list[float]]
-    learned_attn_pt_matrix: list[list[float]]
-    learned_attn_ti_matrix: list[list[float]]
-    learned_attn_t2i_matrix: list[list[float]]
+    learned_attn_df_t_matrix: list[list[float]]
+    learned_attn_df_t_i_matrix: list[list[float]]
+    learned_attn_df_t_2i_matrix: list[list[float]]
     final_cost_matrix: list[list[float]]
     raw_cost_matrix: list[list[float]]
     gated_cost_matrix: list[list[float]]
@@ -180,9 +180,9 @@ def build_reports(
             ],
             appearance_cost_matrix=appearance_cost.tolist(),
             learned_temporal_score_matrix=learned_score.tolist(),
-            learned_attn_pt_matrix=learned_attn_pt.tolist(),
-            learned_attn_ti_matrix=learned_attn_ti.tolist(),
-            learned_attn_t2i_matrix=learned_attn_t2i.tolist(),
+            learned_attn_df_t_matrix=learned_attn_pt.tolist(),
+            learned_attn_df_t_i_matrix=learned_attn_ti.tolist(),
+            learned_attn_df_t_2i_matrix=learned_attn_t2i.tolist(),
             final_cost_matrix=final_cost.tolist(),
             raw_cost_matrix=raw_cost.tolist(),
             gated_cost_matrix=gated_cost.tolist(),
@@ -228,31 +228,31 @@ def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stri
     num_tracks = len(candidate_tracks)
     num_dets = len(detections)
     score_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
-    attn_pt_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
-    attn_ti_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
-    attn_t2i_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
+    attn_df_t_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
+    attn_df_t_i_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
+    attn_df_t_2i_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
 
     det_batch = []
     hist_batch = []
     pair_indices = []
 
     for i, track in enumerate(candidate_tracks):
-        if len(getattr(track, "prot_short_history", [])) < 2 * stride + 1:
+        if len(getattr(track, "det_feat_history", [])) < 2 * stride + 1:
             continue
-        p_t = np.asarray(track.prot_short_history[-1], dtype=np.float32)
-        p_t_i = np.asarray(track.prot_short_history[-1 - stride], dtype=np.float32)
-        p_t_2i = np.asarray(track.prot_short_history[-1 - 2 * stride], dtype=np.float32)
+        df_t = np.asarray(track.det_feat_history[-1], dtype=np.float32)
+        df_t_i = np.asarray(track.det_feat_history[-1 - stride], dtype=np.float32)
+        df_t_2i = np.asarray(track.det_feat_history[-1 - 2 * stride], dtype=np.float32)
         for j, det in enumerate(detections):
             det_feat = np.asarray(det.feature, dtype=np.float32)
             det_norm = np.linalg.norm(det_feat)
             if det_norm > 1e-12:
                 det_feat = det_feat / det_norm
             det_batch.append(det_feat)
-            hist_batch.append(np.stack([p_t, p_t_i, p_t_2i], axis=0))
+            hist_batch.append(np.stack([df_t, df_t_i, df_t_2i], axis=0))
             pair_indices.append((i, j))
 
     if not pair_indices:
-        return score_matrix, attn_pt_matrix, attn_ti_matrix, attn_t2i_matrix
+        return score_matrix, attn_df_t_matrix, attn_df_t_i_matrix, attn_df_t_2i_matrix
 
     det_tensor = torch.from_numpy(np.stack(det_batch, axis=0))
     hist_tensor = torch.from_numpy(np.stack(hist_batch, axis=0))
@@ -261,14 +261,15 @@ def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stri
         score_tensor, attn_tensor = model(det_tensor, hist_tensor, return_attention=True)
 
     scores = score_tensor.detach().cpu().numpy()
-    attn = attn_tensor.detach().cpu().numpy().mean(axis=1).squeeze(1)  # (B, 2)
+    attn = attn_tensor.detach().cpu().numpy().mean(axis=1).squeeze(1)  # (B, 3)
 
     for idx, (i, j) in enumerate(pair_indices):
         score_matrix[i, j] = float(scores[idx])
-        attn_pt_matrix[i, j] = float(attn[idx, 0])
-        attn_ti_matrix[i, j] = float(attn[idx, 1])
+        attn_df_t_matrix[i, j] = float(attn[idx, 0])
+        attn_df_t_i_matrix[i, j] = float(attn[idx, 1])
+        attn_df_t_2i_matrix[i, j] = float(attn[idx, 2])
 
-    return score_matrix, attn_pt_matrix, attn_ti_matrix, attn_t2i_matrix
+    return score_matrix, attn_df_t_matrix, attn_df_t_i_matrix, attn_df_t_2i_matrix
 
 
 class MatchViewerApp:
@@ -510,10 +511,12 @@ class MatchViewerApp:
                 report,
             ),
         )
-        self.matrix_text.insert(tk.END, "\nLearned attention on Delta_1 (p_t - p_t-i)\n")
-        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_pt_matrix, report))
-        self.matrix_text.insert(tk.END, "\nLearned attention on Delta_2 (p_t-i - p_t-2i)\n")
-        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_ti_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned attention on df_t\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_df_t_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned attention on df_t-i\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_df_t_i_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned attention on df_t-2i\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_df_t_2i_matrix, report))
         self.matrix_text.insert(tk.END, "\nFinal cost matrix(before gating)\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.final_cost_matrix, report))
         self.matrix_text.insert(tk.END, "\nGated distance matrix(motion / Kalman gating)\n")
@@ -564,7 +567,7 @@ def parse_args():
     parser.add_argument("--temporal_model_ckpt", type=str, default=None, help="Optional checkpoint path for the learned temporal scorer")
     parser.add_argument("--temporal_hidden_dim", type=int, default=256, help="Hidden dimension for the learned temporal scorer")
     parser.add_argument("--temporal_num_heads", type=int, default=4, help="Number of attention heads for the learned temporal scorer")
-    parser.add_argument("--learned_temporal_stride", type=int, default=2, help="Temporal stride used to sample [p_t, p_t-i, p_t-2i] for the learned temporal scorer")
+    parser.add_argument("--learned_temporal_stride", type=int, default=2, help="Temporal stride used to sample [df_t, df_t-i, df_t-2i] for the learned temporal scorer")
     parser.add_argument("--min_confidence", type=float, default=None)
     parser.add_argument("--min_detection_height", type=int, default=None)
     parser.add_argument("--nms_max_overlap", type=float, default=None)
