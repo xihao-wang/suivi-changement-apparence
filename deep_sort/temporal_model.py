@@ -18,7 +18,7 @@ class TemporalAttentionScorer(nn.Module):
     score:
         Tensor of shape (B,), a scalar matching score per pair.
     attn:
-        Tensor of shape (B, num_heads, 1, T), attention weights for debugging.
+        Tensor of shape (B, num_heads, 1, 2), attention weights for debugging.
     """
 
     def __init__(self, feature_dim, hidden_dim=256, num_heads=4, dropout=0.0):
@@ -33,10 +33,11 @@ class TemporalAttentionScorer(nn.Module):
         self.q_proj = nn.Linear(feature_dim, hidden_dim)
         self.k_proj = nn.Linear(feature_dim, hidden_dim)
         self.v_proj = nn.Linear(feature_dim, hidden_dim)
+        self.token_score_proj = nn.Linear(feature_dim, hidden_dim)
         self.q_norm = nn.LayerNorm(hidden_dim)
         self.k_norm = nn.LayerNorm(hidden_dim)
 
-        self.hist_pos_embed = nn.Parameter(torch.randn(1, 3, hidden_dim) * 0.02)
+        self.hist_pos_embed = nn.Parameter(torch.randn(1, 2, hidden_dim) * 0.02)
 
         # Use batch_first so the module accepts (B, T, C).
         self.attention = nn.MultiheadAttention(
@@ -47,7 +48,7 @@ class TemporalAttentionScorer(nn.Module):
         )
 
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim*2, hidden_dim),
+            nn.Linear(hidden_dim * 4, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
         )
@@ -75,12 +76,21 @@ class TemporalAttentionScorer(nn.Module):
                 f"hist_feat must have at least 3 ordered states, got {hist_feat.size(1)}"
             )
 
-        # query  = current detection feature
-        # tokens = [df_t, df_t-i, df_t-2i]
-        temporal_tokens = hist_feat[:, :3, :]
+        df_t = hist_feat[:, 0, :]
+        df_t_i = hist_feat[:, 1, :]
+        df_t_2i = hist_feat[:, 2, :]
 
-        q = self.q_norm(self.q_proj(det_feat)).unsqueeze(1)  # (B, 1, H)
-        query = q.squeeze(1)  # (B, H)
+        # query  = current change relative to the latest matched detection
+        # tokens = [delta_1, delta_2]
+        delta_now = det_feat - df_t
+        delta_1 = df_t - df_t_i
+        delta_2 = df_t_i - df_t_2i
+        temporal_tokens = torch.stack([delta_1, delta_2], dim=1)  # (B, 2, F)
+
+        q = self.q_norm(self.q_proj(delta_now)).unsqueeze(1)  # (B, 1, H)
+        query_repr = q.squeeze(1)  # (B, H)
+        delta_1_repr = self.token_score_proj(delta_1)  # (B, H)
+        delta_2_repr = self.token_score_proj(delta_2)  # (B, H)
 
         k = self.k_norm(
             self.k_proj(temporal_tokens) + self.hist_pos_embed[:, :temporal_tokens.size(1), :]
@@ -96,11 +106,8 @@ class TemporalAttentionScorer(nn.Module):
         )
         context = context.squeeze(1)  # (B, H)
 
-        ## Option 1: use context alone for scoring.
-        # score = self.mlp(context).squeeze(-1)           # (B,)
-
-        ## Option 2: concatenate query and context for scoring.
-        score = self.mlp(torch.cat([query, context], dim=-1)).squeeze(-1)  # (B,)
+        fused = torch.cat([query_repr, delta_1_repr, delta_2_repr, context], dim=-1)
+        score = self.mlp(fused).squeeze(-1)  # (B,)
 
         if return_attention:
             return score, attn
