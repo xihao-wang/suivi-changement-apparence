@@ -162,7 +162,7 @@ class opts:
         opt.min_confidence = 0.6
         opt.nms_max_overlap = 1.0
         opt.min_detection_height = 0
-        opt.short_memory_size = 5
+        opt.short_memory_size = 12
         opt.long_memory_size = 30
         opt.memory_init_hits = 10
         opt.long_memory_stride = 1
@@ -174,8 +174,8 @@ class opts:
         opt.k = 3 # Number of top distances to consider for k-top cosine distance(in nn_matching.py, _cosine_distance_to_memory function)
         opt.ambiguity_distance_threshold = 0.02
         opt.ambiguity_margin = 0.003
-        opt.trend_scale = 0.01
-        opt.appearance_cost_weight = 0.7
+        opt.trend_scale = 0.42978
+        opt.appearance_cost_weight = 0.0742237
         opt.enable_stm_ltm = False
         opt.enable_memory_init_control = False
         opt.enable_memory_matching = False
