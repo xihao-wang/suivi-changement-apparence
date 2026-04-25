@@ -260,8 +260,8 @@ def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stri
 
     for idx, (i, j) in enumerate(pair_indices):
         score_matrix[i, j] = float(scores[idx])
-        attn_delta1_matrix[i, j] = float(attn[idx, 0])
-        attn_delta2_matrix[i, j] = float(attn[idx, 1])
+        attn_delta1_matrix[i, j] = float(attn[idx, 1])
+        attn_delta2_matrix[i, j] = float(attn[idx, 2])
 
     return score_matrix, attn_delta1_matrix, attn_delta2_matrix
 
@@ -505,9 +505,9 @@ class MatchViewerApp:
                 report,
             ),
         )
-        self.matrix_text.insert(tk.END, "\nLearned attention on Delta_1 (df_t - df_t-i)\n")
+        self.matrix_text.insert(tk.END, "\nLearned attention from det_feat to df_t-i\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_delta1_matrix, report))
-        self.matrix_text.insert(tk.END, "\nLearned attention on Delta_2 (df_t-i - df_t-2i)\n")
+        self.matrix_text.insert(tk.END, "\nLearned attention from det_feat to df_t-2i\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_delta2_matrix, report))
         self.matrix_text.insert(tk.END, "\nFinal cost matrix(before gating)\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.final_cost_matrix, report))
