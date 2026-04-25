@@ -91,9 +91,9 @@ class TemporalAttentionScorer(nn.Module):
         """Project raw feature tokens into the hidden attention space.
 
         Feature-level mapping used for MOT matching:
-        - template/reference token: df_t
+        - template/reference token: prototype built from history
         - current query token: det_feat
-        - temporal memory tokens: [df_t-i, df_t-2i]
+        - temporal memory tokens: [df_t, df_t-i, df_t-2i]
 
         With nn.MultiheadAttention, Q/K/V projections are created internally
         from the query/key/value inputs passed to each attention branch.
@@ -103,10 +103,11 @@ class TemporalAttentionScorer(nn.Module):
         df_t = hist_feat[:, 0, :]
         df_t_i = hist_feat[:, 1, :]
         df_t_2i = hist_feat[:, 2, :]
-        template_token = self.input_proj(df_t).unsqueeze(1)
+        # Use a stable feature-level prototype as the template/reference token.
+        prototype_feat = hist_feat[:, :3, :].mean(dim=1)
+        template_token = self.input_proj(prototype_feat).unsqueeze(1)
         query_token = self.input_proj(det_feat).unsqueeze(1)
-        memory_tokens = self.input_proj(torch.stack([df_t_i, df_t_2i], dim=1))
-        history_tokens = torch.cat([template_token, memory_tokens], dim=1)
+        history_tokens = self.input_proj(torch.stack([df_t, df_t_i, df_t_2i], dim=1))
         history_tokens = (
             history_tokens
             + self.history_pos_embed
@@ -121,7 +122,8 @@ class TemporalAttentionScorer(nn.Module):
         """Apply the formula-4 Attention_t pattern to the reference token.
 
         In the original paper, Attention_t is applied to the initial template.
-        Here the template/reference role is assigned to df_t.
+        Here the template/reference role is assigned to a prototype built from
+        the recent matched-detection history.
         """
         if input_tokens is None:
             input_tokens = self.build_input_tokens(det_feat, hist_feat)
@@ -146,7 +148,7 @@ class TemporalAttentionScorer(nn.Module):
 
         Feature-level mapping of the paper's notation:
         - q_s1: Q of det_feat
-        - k_t1, v_t1: K/V of df_t used as the reference token
+        - the template/reference branch is handled separately by the prototype
         - k_s1...k_sn and v_s1...v_sn: K/V of [df_t, df_t-i, df_t-2i]
 
         This keeps the asymmetric matching structure:
