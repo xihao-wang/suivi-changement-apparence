@@ -25,23 +25,26 @@ class TemporalAttentionScorer(nn.Module):
         Not implemented until the next temporal attention design is added.
     """
 
-    def __init__(self, feature_dim, hidden_dim=256, num_heads=4, dropout=0.0):
+    def __init__(self, feature_dim, hidden_dim=256, num_heads=4, dropout=0.0, history_len=3):
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
+        if history_len < 2:
+            raise ValueError("history_len must be at least 2")
 
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.dropout = dropout
+        self.history_len = history_len
         self.input_proj = nn.Linear(feature_dim, hidden_dim)
-        self.history_pos_embed = nn.Parameter(torch.randn(1, 3, hidden_dim) * 0.02)
+        self.history_pos_embed = nn.Parameter(torch.randn(1, history_len, hidden_dim) * 0.02)
         # Explicitly encode temporal distance:
-        # df_t -> 0 step ago, df_t-i -> 1 step ago, df_t-2i -> 2 steps ago.
-        self.temporal_scale_embed = nn.Parameter(torch.randn(1, 3, hidden_dim) * 0.02)
+        # df_t -> 0 step ago, df_t-i -> 1 step ago, ...
+        self.temporal_scale_embed = nn.Parameter(torch.randn(1, history_len, hidden_dim) * 0.02)
         # Explicitly encode token role:
-        # df_t is the reference token, while df_t-i and df_t-2i are history tokens.
-        self.history_type_embed = nn.Parameter(torch.randn(1, 3, hidden_dim) * 0.02)
+        # slot 0 is the most recent history token, the remaining slots are older history.
+        self.history_type_embed = nn.Parameter(torch.randn(1, history_len, hidden_dim) * 0.02)
         self.det_attention = nn.MultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=num_heads,
@@ -59,7 +62,7 @@ class TemporalAttentionScorer(nn.Module):
         self.output_proj = nn.Linear(hidden_dim, hidden_dim)
         self.output_norm = nn.LayerNorm(hidden_dim)
         self.scorer = nn.Sequential(
-            nn.Linear(hidden_dim * 5 + 3, hidden_dim),
+            nn.Linear(hidden_dim * (2 + history_len) + history_len, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
         )
@@ -82,9 +85,9 @@ class TemporalAttentionScorer(nn.Module):
                 f"hist={hist_feat.size(-1)}"
             )
 
-        if hist_feat.size(1) < 3:
+        if hist_feat.size(1) < self.history_len:
             raise ValueError(
-                f"hist_feat must have at least 3 ordered states, got {hist_feat.size(1)}"
+                f"hist_feat must have at least {self.history_len} ordered states, got {hist_feat.size(1)}"
             )
 
     def build_input_tokens(self, det_feat, hist_feat):
@@ -93,21 +96,18 @@ class TemporalAttentionScorer(nn.Module):
         Feature-level mapping used for MOT matching:
         - template/reference token: prototype built from history
         - current query token: det_feat
-        - temporal memory tokens: [df_t, df_t-i, df_t-2i]
+        - temporal memory tokens: the first history_len ordered states
 
         With nn.MultiheadAttention, Q/K/V projections are created internally
         from the query/key/value inputs passed to each attention branch.
         """
         self._validate_inputs(det_feat, hist_feat)
 
-        df_t = hist_feat[:, 0, :]
-        df_t_i = hist_feat[:, 1, :]
-        df_t_2i = hist_feat[:, 2, :]
         # Use a stable feature-level prototype as the template/reference token.
-        prototype_feat = hist_feat[:, :3, :].mean(dim=1)
+        prototype_feat = hist_feat[:, : self.history_len, :].mean(dim=1)
         template_token = self.input_proj(prototype_feat).unsqueeze(1)
         query_token = self.input_proj(det_feat).unsqueeze(1)
-        history_tokens = self.input_proj(torch.stack([df_t, df_t_i, df_t_2i], dim=1))
+        history_tokens = self.input_proj(hist_feat[:, : self.history_len, :])
         history_tokens = (
             history_tokens
             + self.history_pos_embed
@@ -149,7 +149,7 @@ class TemporalAttentionScorer(nn.Module):
         Feature-level mapping of the paper's notation:
         - q_s1: Q of det_feat
         - the template/reference branch is handled separately by the prototype
-        - k_s1...k_sn and v_s1...v_sn: K/V of [df_t, df_t-i, df_t-2i]
+        - k_s1...k_sn and v_s1...v_sn: K/V of the first history_len ordered states
 
         This keeps the asymmetric matching structure:
         the current detection query attends to the candidate track history.
@@ -216,21 +216,16 @@ class TemporalAttentionScorer(nn.Module):
             attn_mean = history_attn.mean(dim=1).squeeze(1)
             per_history_contrib = attn_mean.unsqueeze(-1) * history_tokens
             fused = torch.cat(
-                [
-                    template_output,
-                    query_output,
-                    per_history_contrib[:, 0, :],
-                    per_history_contrib[:, 1, :],
-                    per_history_contrib[:, 2, :],
-                    attn_mean,
-                ],
+                [template_output, query_output]
+                + [per_history_contrib[:, i, :] for i in range(self.history_len)]
+                + [attn_mean],
                 dim=-1,
             )
         else:
             # Recompute the minimal history path needed by the scorer without
             # returning attention tensors to the caller.
-            _, _, history_tokens = self.build_input_tokens(det_feat, hist_feat)
-            query_token = self.history_query_norm(self.build_input_tokens(det_feat, hist_feat)[1])
+            _, query_token, history_tokens = self.build_input_tokens(det_feat, hist_feat)
+            query_token = self.history_query_norm(query_token)
             history_tokens = self.history_kv_norm(history_tokens)
             _, history_attn = self.history_attention(
                 query_token,
@@ -242,14 +237,9 @@ class TemporalAttentionScorer(nn.Module):
             attn_mean = history_attn.mean(dim=1).squeeze(1)
             per_history_contrib = attn_mean.unsqueeze(-1) * history_tokens
             fused = torch.cat(
-                [
-                    template_output,
-                    query_output,
-                    per_history_contrib[:, 0, :],
-                    per_history_contrib[:, 1, :],
-                    per_history_contrib[:, 2, :],
-                    attn_mean,
-                ],
+                [template_output, query_output]
+                + [per_history_contrib[:, i, :] for i in range(self.history_len)]
+                + [attn_mean],
                 dim=-1,
             )
         score = self.scorer(fused).squeeze(-1)
