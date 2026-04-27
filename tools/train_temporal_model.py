@@ -20,9 +20,9 @@ from deep_sort.temporal_model import TemporalAttentionScorer
 
 
 class TemporalPairDataset(Dataset):
-    def __init__(self, npz_path: str, history_len: int = 3):
+    def __init__(self, npz_path: str, history_indices: list[int] | None = None):
         data = np.load(npz_path)
-        self.history_len = history_len
+        self.history_indices = history_indices or [0, 1, 2]
         self.det_feat = data["det_feat"].astype(np.float32)
         self.df_t = data["df_t"].astype(np.float32) if "df_t" in data else data["p_t"].astype(np.float32)
         self.df_t_i = data["df_t_i"].astype(np.float32) if "df_t_i" in data else data["p_t_i"].astype(np.float32)
@@ -34,17 +34,18 @@ class TemporalPairDataset(Dataset):
 
     def __getitem__(self, idx):
         det = torch.from_numpy(self.det_feat[idx])
-        hist_items = [self.df_t[idx], self.df_t_i[idx], self.df_t_2i[idx]][: self.history_len]
+        history_pool = [self.df_t[idx], self.df_t_i[idx], self.df_t_2i[idx]]
+        hist_items = [history_pool[i] for i in self.history_indices]
         hist = torch.from_numpy(np.stack(hist_items, axis=0))
         label = torch.tensor(self.label[idx], dtype=torch.float32)
         return det, hist, label
 
 
 class MultiTemporalPairDataset(Dataset):
-    def __init__(self, npz_paths: list[str], history_len: int = 3):
+    def __init__(self, npz_paths: list[str], history_indices: list[int] | None = None):
         if not npz_paths:
             raise ValueError("npz_paths must not be empty")
-        self.history_len = history_len
+        self.history_indices = history_indices or [0, 1, 2]
 
         det_feats = []
         df_ts = []
@@ -85,7 +86,8 @@ class MultiTemporalPairDataset(Dataset):
 
     def __getitem__(self, idx):
         det = torch.from_numpy(self.det_feat[idx])
-        hist_items = [self.df_t[idx], self.df_t_i[idx], self.df_t_2i[idx]][: self.history_len]
+        history_pool = [self.df_t[idx], self.df_t_i[idx], self.df_t_2i[idx]]
+        hist_items = [history_pool[i] for i in self.history_indices]
         hist = torch.from_numpy(np.stack(hist_items, axis=0))
         label = torch.tensor(self.label[idx], dtype=torch.float32)
         return det, hist, label
@@ -104,10 +106,28 @@ def parse_args():
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--num_heads", type=int, default=4)
     parser.add_argument("--history_len", type=int, default=3, choices=[2, 3])
+    parser.add_argument(
+        "--history_indices",
+        type=str,
+        default=None,
+        help="Comma-separated selection from {0,1,2}: 0=df_t, 1=df_t-i, 2=df_t-2i. "
+             "If omitted, uses the first --history_len indices.",
+    )
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
+
+
+def parse_history_indices(arg: str | None, history_len: int) -> list[int]:
+    if arg is None:
+        return [0, 1, 2][:history_len]
+    indices = [int(x.strip()) for x in arg.split(",") if x.strip()]
+    if not indices:
+        raise ValueError("--history_indices must not be empty")
+    if any(i not in (0, 1, 2) for i in indices):
+        raise ValueError("--history_indices values must be chosen from {0,1,2}")
+    return indices
 
 
 def evaluate(model, loader, criterion, device):
@@ -134,6 +154,7 @@ def evaluate(model, loader, criterion, device):
 
 def main():
     args = parse_args()
+    history_indices = parse_history_indices(args.history_indices, args.history_len)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -141,8 +162,8 @@ def main():
     if use_explicit_split:
         if not args.train_pair_npz or not args.val_pair_npz:
             raise ValueError("When using explicit split, both --train_pair_npz and --val_pair_npz must be provided")
-        train_set = MultiTemporalPairDataset(args.train_pair_npz, history_len=args.history_len)
-        val_set = MultiTemporalPairDataset(args.val_pair_npz, history_len=args.history_len)
+        train_set = MultiTemporalPairDataset(args.train_pair_npz, history_indices=history_indices)
+        val_set = MultiTemporalPairDataset(args.val_pair_npz, history_indices=history_indices)
         if len(train_set) == 0:
             raise ValueError("Empty training pair dataset")
         if len(val_set) == 0:
@@ -156,7 +177,7 @@ def main():
     else:
         if not args.pair_npz:
             raise ValueError("Provide --pair_npz or both --train_pair_npz and --val_pair_npz")
-        dataset = TemporalPairDataset(args.pair_npz, history_len=args.history_len)
+        dataset = TemporalPairDataset(args.pair_npz, history_indices=history_indices)
         if len(dataset) == 0:
             raise ValueError("Empty pair dataset")
 
@@ -177,7 +198,7 @@ def main():
         feature_dim=feature_dim,
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
-        history_len=args.history_len,
+        history_len=len(history_indices),
     ).to(args.device)
 
     num_pos = float(labels.sum())
@@ -224,7 +245,8 @@ def main():
             "feature_dim": feature_dim,
             "hidden_dim": args.hidden_dim,
             "num_heads": args.num_heads,
-            "history_len": args.history_len,
+            "history_len": len(history_indices),
+            "history_indices": history_indices,
             "train_loss": train_loss,
             "val_loss": val_loss,
             "val_acc": val_acc,

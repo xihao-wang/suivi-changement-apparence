@@ -12,7 +12,8 @@ The codebase contains:
 - a custom video pipeline,
 - several appearance-memory modifications on top of StrongSORT,
 - ablation switches to test each added technique separately,
-- debug tools to inspect per-frame matching.
+- debug tools to inspect per-frame matching,
+- a learned temporal scorer trained on pair-level datasets.
 
 ---
 
@@ -29,6 +30,7 @@ For the current project, the important blocks are:
   - memory-aware matching
   - top-k matching
   - appearance trend
+  - learned temporal scorer
 
 ---
 
@@ -372,7 +374,186 @@ python3 tools/debug_match_viewer.py \
 
 ---
 
-## 8. Output Files
+## 8. Learned Temporal Scorer
+
+The repository now contains a **feature-level temporal scorer** for MOT matching.
+
+### Current design
+
+The current temporal model is implemented in:
+
+```text
+deep_sort/temporal_model.py
+```
+
+It is **not** a full reproduction of the 2024 patch-token TIE tracker.  
+It is a lightweight scorer adapted to the current StrongSORT pipeline:
+
+- `template/reference` token: a prototype built from the selected history features
+- `query` token: current `det_feat`
+- `history` tokens: a selectable subset of
+  - `df_t`
+  - `df_t-i`
+  - `df_t-2i`
+
+The model uses:
+
+- one template self-attention branch
+- one history attention branch
+- explicit temporal / type embeddings on history tokens
+- an MLP scorer on top of the temporal outputs
+
+### Training sample format
+
+Pair datasets are stored as `.npz` files built from:
+
+- current detection feature `det_feat`
+- ordered matched-detection history
+  - `df_t`
+  - `df_t_i`
+  - `df_t_2i`
+- binary label `label`
+
+This data is built with:
+
+```bash
+python3 tools/build_temporal_pairs.py \
+  --sequence_dir data/CustomDemo/test/YT-03 \
+  --detection_file data/StrongSORT_data/CustomDemo_test_YOLOX+BoT/YT-03.npy \
+  --result_txt results/ours/sep_combi/YT-03_case14.txt \
+  --output_npz data/temporal_pairs/YT-03_pairs.npz \
+  --dataset CustomDemo \
+  --split test \
+  --BoT \
+  --ltm_stm \
+  --memory_init \
+  --memory_aware \
+  --topk \
+  --temporal_stride 2
+```
+
+### Train the temporal scorer
+
+Standard training command:
+
+```bash
+python3 tools/train_temporal_model.py \
+  --train_pair_npz $(printf "data/temporal_pairs/%s_pairs.npz " new-1 new-2 new-3 new-5 new-6 new-8 new-9) \
+  --val_pair_npz data/temporal_pairs/YT-03_pairs.npz \
+  --save_dir data/checkpoints/temporal_model_multi \
+  --batch_size 64 \
+  --lr 1e-4 \
+  --epochs 50 \
+  --hidden_dim 256 \
+  --num_heads 4
+```
+
+### Select which history tokens are used during training
+
+`tools/train_temporal_model.py` supports **training-time ablation** through:
+
+```bash
+--history_indices
+```
+
+History slot convention:
+
+- `0 = df_t`
+- `1 = df_t-i`
+- `2 = df_t-2i`
+
+Examples:
+
+Use all three:
+
+```bash
+--history_indices 0,1,2
+```
+
+Use `[df_t, df_t-i]`:
+
+```bash
+--history_indices 0,1
+```
+
+Use `[df_t, df_t-2i]`:
+
+```bash
+--history_indices 0,2
+```
+
+Complete examples:
+
+```bash
+python3 tools/train_temporal_model.py \
+  --train_pair_npz $(printf "data/temporal_pairs/%s_pairs.npz " new-1 new-2 new-3 new-5 new-6 new-8 new-9) \
+  --val_pair_npz data/temporal_pairs/YT-03_pairs.npz \
+  --save_dir data/checkpoints/ablation_hist012 \
+  --batch_size 64 \
+  --lr 1e-4 \
+  --epochs 50 \
+  --hidden_dim 256 \
+  --num_heads 4 \
+  --history_indices 0,1,2
+```
+
+```bash
+python3 tools/train_temporal_model.py \
+  --train_pair_npz $(printf "data/temporal_pairs/%s_pairs.npz " new-1 new-2 new-3 new-5 new-6 new-8 new-9) \
+  --val_pair_npz data/temporal_pairs/YT-03_pairs.npz \
+  --save_dir data/checkpoints/ablation_hist01 \
+  --batch_size 64 \
+  --lr 1e-4 \
+  --epochs 50 \
+  --hidden_dim 256 \
+  --num_heads 4 \
+  --history_indices 0,1
+```
+
+```bash
+python3 tools/train_temporal_model.py \
+  --train_pair_npz $(printf "data/temporal_pairs/%s_pairs.npz " new-1 new-2 new-3 new-5 new-6 new-8 new-9) \
+  --val_pair_npz data/temporal_pairs/YT-03_pairs.npz \
+  --save_dir data/checkpoints/ablation_hist02 \
+  --batch_size 64 \
+  --lr 1e-4 \
+  --epochs 50 \
+  --hidden_dim 256 \
+  --num_heads 4 \
+  --history_indices 0,2
+```
+
+### Inspect the learned scorer in the viewer
+
+The GUI viewer can display:
+
+- learned temporal score matrix
+- learned attention on history tokens
+
+Example:
+
+```bash
+python3 tools/debug_match_viewer.py \
+  --sequence_dir data/CustomDemo/test/YT-03 \
+  --detection_file data/StrongSORT_data/CustomDemo_test_YOLOX+BoT/YT-03.npy \
+  --BoT \
+  --ltm_stm \
+  --memory_init \
+  --memory_aware \
+  --topk \
+  --learned_temporal \
+  --temporal_model_ckpt data/checkpoints/temporal_model_multi/best.pt
+```
+
+### Notes
+
+- `--history_len` is still accepted, but for controlled ablations `--history_indices` is preferred.
+- The learned temporal scorer is currently designed for **pair scoring**, not for end-to-end box prediction.
+- The current model is a **feature-level approximation** of temporal attention, not the original image-patch TIE architecture.
+
+---
+
+## 9. Output Files
 
 Typical outputs:
 

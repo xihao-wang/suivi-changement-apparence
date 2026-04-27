@@ -192,8 +192,8 @@ class TemporalAttentionScorer(nn.Module):
 
         attention_tokens = torch.cat([template_context, history_context], dim=1)
         projected_tokens = self.output_proj(attention_tokens)
-        # output_tokens = self.output_norm(projected_tokens + 0.1 * branch_inputs)
-        output_tokens = self.output_norm(projected_tokens)
+        output_tokens = self.output_norm(projected_tokens + 0.1 * branch_inputs)
+        # output_tokens = self.output_norm(projected_tokens)
 
 
         if return_attention:
