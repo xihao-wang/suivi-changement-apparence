@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Build pair-level training samples for the learned temporal scorer.
+"""Build frame/bbox temporal pairs for the patch-token matcher.
 
 Each sample contains:
-  - det_feat
-  - df_t
-  - df_t_i
-  - df_t_2i
-  - label
+  - initial template frame index and bbox
+  - current detection frame index and bbox
+  - ordered online-template history frame indices and bboxes
+  - binary label
 
 Pseudo labels are derived from a tracking result txt by matching detections
-to result boxes with IoU.
+to result boxes with IoU. This builder intentionally avoids any feature-level
+memory logic so the patch-token experiments depend only on:
+  - raw frames
+  - detection boxes
+  - temporal ordering
+  - pseudo labels
 """
 
 from __future__ import annotations
@@ -17,8 +21,10 @@ from __future__ import annotations
 import argparse
 import sys
 from collections import defaultdict
+import os
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -27,34 +33,57 @@ if str(REPO_ROOT) not in sys.path:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Build temporal pair dataset from a sequence.")
+    parser = argparse.ArgumentParser(
+        description="Build patch-token temporal pairs from a sequence."
+    )
     parser.add_argument("--sequence_dir", required=True)
     parser.add_argument("--detection_file", required=True)
-    parser.add_argument("--result_txt", required=True, help="Tracking result txt used as pseudo labels")
+    parser.add_argument(
+        "--result_txt",
+        required=True,
+        help="Tracking result txt used as pseudo labels",
+    )
     parser.add_argument("--output_npz", required=True)
-
-    parser.add_argument("--dataset", default="CustomDemo")
-    parser.add_argument("--split", default="test", choices=["test", "val"])
-    parser.add_argument("--BoT", action="store_true")
-    parser.add_argument("--ECC", action="store_true")
-    parser.add_argument("--NSA", action="store_true")
-    parser.add_argument("--EMA", action="store_true")
-    parser.add_argument("--MC", action="store_true")
-    parser.add_argument("--woC", action="store_true")
-    parser.add_argument("--ltm_stm", action="store_true")
-    parser.add_argument("--memory_init", action="store_true")
-    parser.add_argument("--memory_aware", action="store_true")
-    parser.add_argument("--topk", action="store_true")
-
-    parser.add_argument("--min_confidence", type=float, default=None)
-    parser.add_argument("--min_detection_height", type=int, default=None)
-    parser.add_argument("--nms_max_overlap", type=float, default=None)
-    parser.add_argument("--max_cosine_distance", type=float, default=None)
-    parser.add_argument("--nn_budget", type=int, default=None)
-
+    parser.add_argument("--min_confidence", type=float, default=0.3)
+    parser.add_argument("--min_detection_height", type=int, default=0)
     parser.add_argument("--temporal_stride", type=int, default=2)
     parser.add_argument("--iou_threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--require_multi_identity_frame",
+        action="store_true",
+        help="Keep only frames with at least two visible pseudo identities. "
+             "Useful when the downstream task is pairwise matching.",
+    )
     return parser.parse_args()
+
+
+def gather_sequence_info(sequence_dir, detection_file):
+    image_dir = os.path.join(sequence_dir, "img1")
+    image_filenames = {
+        int(os.path.splitext(f)[0]): os.path.join(image_dir, f)
+        for f in os.listdir(image_dir)
+    }
+
+    detections = np.load(detection_file) if detection_file is not None else None
+
+    if len(image_filenames) > 0:
+        image = cv2.imread(next(iter(image_filenames.values())), cv2.IMREAD_GRAYSCALE)
+        image_size = image.shape
+        min_frame_idx = min(image_filenames.keys())
+        max_frame_idx = max(image_filenames.keys())
+    else:
+        image_size = None
+        min_frame_idx = int(detections[:, 0].min())
+        max_frame_idx = int(detections[:, 0].max())
+
+    return {
+        "sequence_name": os.path.basename(sequence_dir),
+        "image_filenames": image_filenames,
+        "detections": detections,
+        "image_size": image_size,
+        "min_frame_idx": min_frame_idx,
+        "max_frame_idx": max_frame_idx,
+    }
 
 
 def load_result_rows(result_txt: str):
@@ -69,12 +98,15 @@ def load_result_rows(result_txt: str):
                 continue
             frame = int(float(parts[0]))
             track_id = int(float(parts[1]))
-            tlwh = [float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])]
+            tlwh = np.asarray(
+                [float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])],
+                dtype=np.float32,
+            )
             by_frame[frame].append({"track_id": track_id, "tlwh": tlwh})
     return by_frame
 
 
-def iou_tlwh(a, b):
+def iou_tlwh(a: np.ndarray, b: np.ndarray) -> float:
     ax1, ay1, aw, ah = a
     bx1, by1, bw, bh = b
     ax2, ay2 = ax1 + aw, ay1 + ah
@@ -95,13 +127,13 @@ def iou_tlwh(a, b):
     return inter / union
 
 
-def infer_detection_target_ids(detections, result_rows, iou_threshold):
+def infer_detection_target_ids(det_boxes, result_rows, iou_threshold):
     target_ids = []
-    for det in detections:
+    for det_tlwh in det_boxes:
         best_iou = 0.0
         best_id = None
         for row in result_rows:
-            iou = iou_tlwh(det.tlwh, row["tlwh"])
+            iou = iou_tlwh(det_tlwh, row["tlwh"])
             if iou > best_iou:
                 best_iou = iou
                 best_id = row["track_id"]
@@ -112,169 +144,147 @@ def infer_detection_target_ids(detections, result_rows, iou_threshold):
     return target_ids
 
 
+def load_frame_detections(detection_mat, frame_idx, min_confidence, min_height):
+    frame_mask = detection_mat[:, 0].astype(int) == frame_idx
+    rows = detection_mat[frame_mask]
+    if rows.size == 0:
+        return np.empty((0, 4), dtype=np.float32), np.empty((0,), dtype=np.float32)
+
+    boxes = rows[:, 2:6].astype(np.float32)
+    scores = rows[:, 6].astype(np.float32)
+    keep = (scores >= min_confidence) & (boxes[:, 3] >= min_height)
+    return boxes[keep], scores[keep]
+
+
+def select_one_detection_per_track(det_boxes, det_scores, det_target_ids):
+    """Pick one positive detection per pseudo track in the current frame.
+
+    Multiple detections may overlap the same pseudo result box. For history
+    construction, keep the highest-confidence one.
+    """
+    selected = {}
+    for det_idx, target_id in enumerate(det_target_ids):
+        if target_id is None:
+            continue
+        score = float(det_scores[det_idx])
+        if target_id not in selected or score > selected[target_id]["score"]:
+            selected[target_id] = {
+                "score": score,
+                "bbox": det_boxes[det_idx].copy(),
+            }
+    return selected
+
+
 def main():
     args = parse_args()
-    opt_argv = [sys.argv[0], args.dataset, args.split]
-    for flag, enabled in [
-        ("--BoT", args.BoT),
-        ("--ECC", args.ECC),
-        ("--NSA", args.NSA),
-        ("--EMA", args.EMA),
-        ("--MC", args.MC),
-        ("--woC", args.woC),
-        ("--ltm_stm", args.ltm_stm),
-        ("--memory_init", args.memory_init),
-        ("--memory_aware", args.memory_aware),
-        ("--topk", args.topk),
-    ]:
-        if enabled:
-            opt_argv.append(flag)
-    sys.argv = opt_argv
-
-    from application_util import preprocessing
-    from deep_sort import nn_matching
-    from deep_sort.tracker import Tracker
-    from deep_sort_app import create_detections, gather_sequence_info
-    from opts import opt
-
-    min_confidence = opt.min_confidence if args.min_confidence is None else args.min_confidence
-    min_detection_height = (
-        opt.min_detection_height if args.min_detection_height is None else args.min_detection_height
-    )
-    nms_max_overlap = opt.nms_max_overlap if args.nms_max_overlap is None else args.nms_max_overlap
-    max_cosine_distance = (
-        opt.max_cosine_distance if args.max_cosine_distance is None else args.max_cosine_distance
-    )
-    nn_budget = opt.nn_budget if args.nn_budget is None else args.nn_budget
-
     seq_info = gather_sequence_info(args.sequence_dir, args.detection_file)
+    detections = seq_info["detections"]
+    if detections is None:
+        raise ValueError("Detection file did not contain any detections")
+
     result_by_frame = load_result_rows(args.result_txt)
+    stride = max(1, int(args.temporal_stride))
 
-    metric = nn_matching.NearestNeighborDistanceMetric("cosine", max_cosine_distance, nn_budget)
-    tracker = Tracker(metric)
-
-    det_feat_list = []
-    df_t_list = []
-    df_t_i_list = []
-    df_t_2i_list = []
+    init_frame_list = []
+    init_bbox_list = []
+    det_frame_list = []
+    det_bbox_list = []
+    hist_frame_list = []
+    hist_bbox_list = []
     label_list = []
     frame_list = []
     track_id_list = []
     det_index_list = []
 
-    stride = max(1, int(args.temporal_stride))
+    # External history cache keyed by pseudo track id.
+    # Each item is {"frame": int, "bbox": np.ndarray(4,)}
+    track_histories: dict[int, list[dict[str, np.ndarray | int]]] = defaultdict(list)
 
     min_frame = seq_info["min_frame_idx"]
     max_frame = seq_info["max_frame_idx"]
     for frame_idx in range(min_frame, max_frame + 1):
-        detections = create_detections(seq_info["detections"], frame_idx, min_detection_height)
-        detections = [d for d in detections if d.confidence >= min_confidence]
-
-        boxes = np.array([d.tlwh for d in detections])
-        scores = np.array([d.confidence for d in detections])
-        indices = preprocessing.non_max_suppression(boxes, nms_max_overlap, scores)
-        detections = [detections[i] for i in indices]
-
-        if opt.ECC:
-            tracker.camera_update(Path(args.sequence_dir).name, frame_idx)
-
-        tracker.predict()
-
-        candidate_tracks = [t for t in tracker.tracks if t.is_confirmed()]
-        result_rows = result_by_frame.get(frame_idx, [])
-        det_target_ids = infer_detection_target_ids(detections, result_rows, args.iou_threshold)
-        valid_target_ids = {target_id for target_id in det_target_ids if target_id is not None}
-
-        # Skip frames where only one identity is available. These frames mostly
-        # contribute positives and do not provide useful contrastive supervision
-        # for pair construction.
-        if len(valid_target_ids) <= 1:
-            matches, unmatched_tracks, unmatched_detections = tracker._match(detections)
-            for track_idx, detection_idx in matches:
-                tracker.tracks[track_idx].update(detections[detection_idx])
-            for track_idx in unmatched_tracks:
-                tracker.tracks[track_idx].mark_missed()
-            for detection_idx in unmatched_detections:
-                tracker._initiate_track(detections[detection_idx])
-            tracker.tracks = [t for t in tracker.tracks if not t.is_deleted()]
-
-            active_targets = [t.track_id for t in tracker.tracks if t.is_confirmed()]
-            feat_list, target_list = [], []
-            for track in tracker.tracks:
-                if not track.is_confirmed():
-                    continue
-                feat_list += track.features
-                target_list += [track.track_id for _ in track.features]
-                if not opt.EMA:
-                    track.features = []
-            tracker.metric.partial_fit(np.asarray(feat_list), np.asarray(target_list), active_targets)
+        det_boxes, det_scores = load_frame_detections(
+            detections,
+            frame_idx,
+            min_confidence=args.min_confidence,
+            min_height=args.min_detection_height,
+        )
+        if det_boxes.shape[0] == 0:
             continue
 
-        for track in candidate_tracks:
-            history = getattr(track, "det_feat_history", [])
+        result_rows = result_by_frame.get(frame_idx, [])
+        det_target_ids = infer_detection_target_ids(
+            det_boxes, result_rows, args.iou_threshold
+        )
+        valid_target_ids = sorted(
+            {track_id for track_id in det_target_ids if track_id is not None}
+        )
+
+        if args.require_multi_identity_frame and len(valid_target_ids) <= 1:
+            selected = select_one_detection_per_track(det_boxes, det_scores, det_target_ids)
+            for track_id, item in selected.items():
+                track_histories[track_id].append(
+                    {"frame": frame_idx, "bbox": item["bbox"]}
+                )
+            continue
+
+        valid_det_indices = [
+            det_idx
+            for det_idx, target_id in enumerate(det_target_ids)
+            if target_id is not None
+        ]
+
+        for track_id in valid_target_ids:
+            history = track_histories.get(track_id, [])
             if len(history) < 2 * stride + 1:
                 continue
 
-            df_t = np.asarray(history[-1], dtype=np.float32)
-            df_t_i = np.asarray(history[-1 - stride], dtype=np.float32)
-            df_t_2i = np.asarray(history[-1 - 2 * stride], dtype=np.float32)
-
-            positive_det_indices = [
-                det_idx for det_idx, target_id in enumerate(det_target_ids)
-                if target_id == track.track_id
+            init_item = history[0]
+            hist_items = [
+                history[-1],
+                history[-1 - stride],
+                history[-1 - 2 * stride],
             ]
-            if not positive_det_indices:
-                continue
-
-            valid_det_indices = [
-                det_idx for det_idx, target_id in enumerate(det_target_ids)
-                if target_id is not None
-            ]
+            hist_frames = np.asarray(
+                [int(item["frame"]) for item in hist_items],
+                dtype=np.int32,
+            )
+            hist_bboxes = np.stack(
+                [np.asarray(item["bbox"], dtype=np.float32) for item in hist_items],
+                axis=0,
+            )
 
             for det_idx in valid_det_indices:
-                det = detections[det_idx]
-                det_feat = np.asarray(det.feature, dtype=np.float32)
-                det_norm = np.linalg.norm(det_feat)
-                if det_norm > 1e-12:
-                    det_feat = det_feat / det_norm
-
-                det_feat_list.append(det_feat)
-                df_t_list.append(df_t)
-                df_t_i_list.append(df_t_i)
-                df_t_2i_list.append(df_t_2i)
-                label_list.append(1.0 if det_target_ids[det_idx] == track.track_id else 0.0)
+                init_frame_list.append(int(init_item["frame"]))
+                init_bbox_list.append(np.asarray(init_item["bbox"], dtype=np.float32))
+                det_frame_list.append(frame_idx)
+                det_bbox_list.append(det_boxes[det_idx].copy())
+                hist_frame_list.append(hist_frames.copy())
+                hist_bbox_list.append(hist_bboxes.copy())
+                label_list.append(
+                    1.0 if det_target_ids[det_idx] == track_id else 0.0
+                )
                 frame_list.append(frame_idx)
-                track_id_list.append(track.track_id)
+                track_id_list.append(track_id)
                 det_index_list.append(det_idx)
 
-        matches, unmatched_tracks, unmatched_detections = tracker._match(detections)
-        for track_idx, detection_idx in matches:
-            tracker.tracks[track_idx].update(detections[detection_idx])
-        for track_idx in unmatched_tracks:
-            tracker.tracks[track_idx].mark_missed()
-        for detection_idx in unmatched_detections:
-            tracker._initiate_track(detections[detection_idx])
-        tracker.tracks = [t for t in tracker.tracks if not t.is_deleted()]
-
-        active_targets = [t.track_id for t in tracker.tracks if t.is_confirmed()]
-        feat_list, target_list = [], []
-        for track in tracker.tracks:
-            if not track.is_confirmed():
-                continue
-            feat_list += track.features
-            target_list += [track.track_id for _ in track.features]
-            if not opt.EMA:
-                track.features = []
-        tracker.metric.partial_fit(np.asarray(feat_list), np.asarray(target_list), active_targets)
+        selected = select_one_detection_per_track(det_boxes, det_scores, det_target_ids)
+        for track_id, item in selected.items():
+            track_histories[track_id].append(
+                {"frame": frame_idx, "bbox": item["bbox"]}
+            )
 
     output_path = Path(args.output_npz)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        det_feat=np.asarray(det_feat_list, dtype=np.float32),
-        df_t=np.asarray(df_t_list, dtype=np.float32),
-        df_t_i=np.asarray(df_t_i_list, dtype=np.float32),
-        df_t_2i=np.asarray(df_t_2i_list, dtype=np.float32),
+        sequence_dir=np.asarray(str(Path(args.sequence_dir).resolve())),
+        init_frame=np.asarray(init_frame_list, dtype=np.int32),
+        init_bbox=np.asarray(init_bbox_list, dtype=np.float32),
+        det_frame=np.asarray(det_frame_list, dtype=np.int32),
+        det_bbox=np.asarray(det_bbox_list, dtype=np.float32),
+        hist_frame=np.asarray(hist_frame_list, dtype=np.int32),
+        hist_bbox=np.asarray(hist_bbox_list, dtype=np.float32),
         label=np.asarray(label_list, dtype=np.float32),
         frame=np.asarray(frame_list, dtype=np.int32),
         track_id=np.asarray(track_id_list, dtype=np.int32),
@@ -285,7 +295,7 @@ def main():
     num_samples = len(label_list)
     num_pos = int(np.sum(label_list))
     num_neg = num_samples - num_pos
-    print(f"Saved pair dataset to: {output_path}")
+    print(f"Saved patch-token pair dataset to: {output_path}")
     print(f"Samples: {num_samples}, positives: {num_pos}, negatives: {num_neg}")
 
 
