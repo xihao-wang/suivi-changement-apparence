@@ -5,13 +5,15 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
+import random
 
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import BatchSampler, DataLoader, Dataset
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -73,6 +75,9 @@ def load_patch_pair_npz(npz_path: str):
         "hist_frame": data["hist_frame"].astype(np.int32),
         "hist_bbox": data["hist_bbox"].astype(np.float32),
         "label": data["label"].astype(np.float32),
+        "frame": data["frame"].astype(np.int32),
+        "track_id": data["track_id"].astype(np.int32),
+        "det_index": data["det_index"].astype(np.int32),
     }
 
 
@@ -100,6 +105,9 @@ class PatchTemporalPairDataset(Dataset):
         hist_frames = []
         hist_bboxes = []
         labels = []
+        frames = []
+        track_ids = []
+        det_indices = []
 
         for npz_path in npz_paths:
             payload = load_patch_pair_npz(npz_path)
@@ -112,6 +120,9 @@ class PatchTemporalPairDataset(Dataset):
             hist_frames.append(payload["hist_frame"][:, history_indices])
             hist_bboxes.append(payload["hist_bbox"][:, history_indices, :])
             labels.append(payload["label"])
+            frames.append(payload["frame"])
+            track_ids.append(payload["track_id"])
+            det_indices.append(payload["det_index"])
 
         self.sequence_dirs = np.asarray(sequence_dirs)
         self.init_frame = np.concatenate(init_frames, axis=0)
@@ -121,6 +132,20 @@ class PatchTemporalPairDataset(Dataset):
         self.hist_frame = np.concatenate(hist_frames, axis=0)
         self.hist_bbox = np.concatenate(hist_bboxes, axis=0)
         self.label = np.concatenate(labels, axis=0)
+        self.frame = np.concatenate(frames, axis=0)
+        self.track_id = np.concatenate(track_ids, axis=0)
+        self.det_index = np.concatenate(det_indices, axis=0)
+
+        group_to_id = {}
+        group_ids = []
+        next_group_id = 0
+        for seq_dir, frame, track_id in zip(self.sequence_dirs, self.frame, self.track_id):
+            key = (str(seq_dir), int(frame), int(track_id))
+            if key not in group_to_id:
+                group_to_id[key] = next_group_id
+                next_group_id += 1
+            group_ids.append(group_to_id[key])
+        self.group_ids = np.asarray(group_ids, dtype=np.int64)
 
     def __len__(self):
         return len(self.label)
@@ -149,7 +174,62 @@ class PatchTemporalPairDataset(Dataset):
             hist_items.append(self._read_crop(sequence_dir, frame_idx, tlwh))
         hist_crops = torch.stack(hist_items, dim=0)
         label = torch.tensor(self.label[idx], dtype=torch.float32)
-        return init_crop, det_crop, hist_crops, label
+        group_id = torch.tensor(self.group_ids[idx], dtype=torch.long)
+        return init_crop, det_crop, hist_crops, label, group_id
+
+
+class GroupBatchSampler(BatchSampler):
+    def __init__(self, group_ids, batch_size: int, shuffle: bool):
+        self.group_ids = np.asarray(group_ids, dtype=np.int64)
+        self.batch_size = int(batch_size)
+        self.shuffle = shuffle
+
+        unique_ids, first_indices = np.unique(self.group_ids, return_index=True)
+        order = np.argsort(first_indices)
+        self.ordered_group_ids = unique_ids[order].tolist()
+        self.group_to_indices = {
+            int(group_id): np.where(self.group_ids == group_id)[0].tolist()
+            for group_id in unique_ids
+        }
+
+    def __iter__(self):
+        group_ids = list(self.ordered_group_ids)
+        if self.shuffle:
+            random.shuffle(group_ids)
+
+        batch = []
+        batch_count = 0
+        for group_id in group_ids:
+            indices = self.group_to_indices[int(group_id)]
+            group_size = len(indices)
+            if batch and batch_count + group_size > self.batch_size:
+                yield batch
+                batch = []
+                batch_count = 0
+            batch.extend(indices)
+            batch_count += group_size
+            if batch_count >= self.batch_size:
+                yield batch
+                batch = []
+                batch_count = 0
+        if batch:
+            yield batch
+
+    def __len__(self):
+        num_batches = 0
+        batch_count = 0
+        for group_id in self.ordered_group_ids:
+            group_size = len(self.group_to_indices[int(group_id)])
+            if batch_count > 0 and batch_count + group_size > self.batch_size:
+                num_batches += 1
+                batch_count = 0
+            batch_count += group_size
+            if batch_count >= self.batch_size:
+                num_batches += 1
+                batch_count = 0
+        if batch_count > 0:
+            num_batches += 1
+        return num_batches
 
 
 def parse_args():
@@ -163,6 +243,37 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--num_heads", type=int, default=4)
+    parser.add_argument("--num_stages", type=int, default=3, choices=[1, 2, 3])
+    parser.add_argument(
+        "--stage_dims",
+        type=str,
+        default=None,
+        help="Comma-separated stage embedding dims. Defaults to paper-style values.",
+    )
+    parser.add_argument(
+        "--stage_heads",
+        type=str,
+        default=None,
+        help="Comma-separated stage attention heads. Defaults to paper-style values.",
+    )
+    parser.add_argument(
+        "--stage_depths",
+        type=str,
+        default=None,
+        help="Comma-separated number of MAM blocks per stage. Defaults to paper-style values.",
+    )
+    parser.add_argument(
+        "--stage_kernels",
+        type=str,
+        default=None,
+        help="Comma-separated stage embedding kernel sizes.",
+    )
+    parser.add_argument(
+        "--stage_strides",
+        type=str,
+        default=None,
+        help="Comma-separated stage embedding strides.",
+    )
     parser.add_argument("--patch_size", type=int, default=16)
     parser.add_argument("--image_height", type=int, default=256)
     parser.add_argument("--image_width", type=int, default=128)
@@ -181,6 +292,35 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument(
+        "--objective",
+        choices=["bce", "ranking", "hybrid"],
+        default="hybrid",
+        help="Training objective.",
+    )
+    parser.add_argument(
+        "--ranking_margin",
+        type=float,
+        default=0.2,
+        help="Margin used by ranking objective.",
+    )
+    parser.add_argument(
+        "--ranking_weight",
+        type=float,
+        default=1.0,
+        help="Weight of ranking term when objective=hybrid.",
+    )
+    parser.add_argument(
+        "--disable_pin_memory",
+        action="store_true",
+        help="Disable DataLoader pin_memory.",
+    )
+    parser.add_argument(
+        "--disable_persistent_workers",
+        action="store_true",
+        help="Disable DataLoader persistent_workers when num_workers > 0.",
+    )
     return parser.parse_args()
 
 
@@ -195,19 +335,73 @@ def parse_history_indices(arg: str | None, history_len: int) -> list[int]:
     return indices
 
 
-def evaluate(model, loader, criterion, device):
+def parse_int_list(arg: str | None) -> list[int] | None:
+    if arg is None:
+        return None
+    values = [int(x.strip()) for x in arg.split(",") if x.strip()]
+    if not values:
+        raise ValueError("Empty stage configuration list")
+    return values
+
+
+def pairwise_ranking_loss(logits, labels, group_ids, margin: float):
+    losses = []
+    unique_groups = torch.unique(group_ids)
+    for group_id in unique_groups:
+        mask = group_ids == group_id
+        group_logits = logits[mask]
+        group_labels = labels[mask]
+        pos = group_logits[group_labels >= 0.5]
+        neg = group_logits[group_labels < 0.5]
+        if pos.numel() == 0 or neg.numel() == 0:
+            continue
+        diff = pos[:, None] - neg[None, :]
+        losses.append(torch.relu(margin - diff).mean())
+    if not losses:
+        return logits.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def compute_objective_loss(
+    objective,
+    logits,
+    labels,
+    group_ids,
+    bce_criterion,
+    ranking_margin,
+    ranking_weight,
+):
+    if objective == "bce":
+        return bce_criterion(logits, labels)
+    ranking = pairwise_ranking_loss(logits, labels, group_ids, ranking_margin)
+    if objective == "ranking":
+        return ranking
+    bce = bce_criterion(logits, labels)
+    return bce + ranking_weight * ranking
+
+
+def evaluate(model, loader, bce_criterion, device, objective, ranking_margin, ranking_weight):
     model.eval()
     total_loss = 0.0
     total = 0
     correct = 0
     with torch.no_grad():
-        for init_crop, det_crop, hist_crops, label in loader:
+        for init_crop, det_crop, hist_crops, label, group_id in loader:
             init_crop = init_crop.to(device)
             det_crop = det_crop.to(device)
             hist_crops = hist_crops.to(device)
             label = label.to(device)
+            group_id = group_id.to(device)
             logits = model(init_crop, det_crop, hist_crops, return_attention=False)
-            loss = criterion(logits, label)
+            loss = compute_objective_loss(
+                objective,
+                logits,
+                label,
+                group_id,
+                bce_criterion,
+                ranking_margin,
+                ranking_weight,
+            )
             total_loss += float(loss.item()) * det_crop.size(0)
             probs = torch.sigmoid(logits)
             preds = (probs >= 0.5).float()
@@ -223,6 +417,15 @@ def main():
     history_indices = parse_history_indices(args.history_indices, args.history_len)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    print(
+        f"Training objective: {args.objective} "
+        f"(ranking_margin={args.ranking_margin}, ranking_weight={args.ranking_weight})"
+    )
+    stage_dims = parse_int_list(args.stage_dims)
+    stage_heads = parse_int_list(args.stage_heads)
+    stage_depths = parse_int_list(args.stage_depths)
+    stage_kernels = parse_int_list(args.stage_kernels)
+    stage_strides = parse_int_list(args.stage_strides)
 
     train_set = PatchTemporalPairDataset(
         args.train_pair_npz,
@@ -243,8 +446,47 @@ def main():
     if len(val_set) == 0:
         raise ValueError("Empty validation pair dataset")
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False)
+    dataloader_kwargs = {
+        "num_workers": args.num_workers,
+        "pin_memory": (not args.disable_pin_memory),
+    }
+    if args.num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = (
+            not args.disable_persistent_workers
+        )
+
+    if args.objective in {"ranking", "hybrid"}:
+        train_loader = DataLoader(
+            train_set,
+            batch_sampler=GroupBatchSampler(
+                train_set.group_ids,
+                batch_size=args.batch_size,
+                shuffle=True,
+            ),
+            **dataloader_kwargs,
+        )
+        val_loader = DataLoader(
+            val_set,
+            batch_sampler=GroupBatchSampler(
+                val_set.group_ids,
+                batch_size=args.batch_size,
+                shuffle=False,
+            ),
+            **dataloader_kwargs,
+        )
+    else:
+        train_loader = DataLoader(
+            train_set,
+            batch_size=args.batch_size,
+            shuffle=True,
+            **dataloader_kwargs,
+        )
+        val_loader = DataLoader(
+            val_set,
+            batch_size=args.batch_size,
+            shuffle=False,
+            **dataloader_kwargs,
+        )
 
     model = TemporalAttentionScorer(
         image_height=args.image_height,
@@ -253,6 +495,12 @@ def main():
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
         history_len=len(history_indices),
+        num_stages=args.num_stages,
+        stage_dims=stage_dims,
+        stage_heads=stage_heads,
+        stage_depths=stage_depths,
+        stage_kernels=stage_kernels,
+        stage_strides=stage_strides,
     ).to(args.device)
 
     labels = train_set.label
@@ -260,7 +508,7 @@ def main():
     num_neg = float(len(labels) - num_pos)
     pos_weight = torch.tensor([num_neg / max(num_pos, 1.0)], device=args.device)
 
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    bce_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=args.lr,
@@ -273,19 +521,29 @@ def main():
     best_val_loss = float("inf")
     best_epoch = -1
     for epoch in range(1, args.epochs + 1):
+        epoch_start = time.perf_counter()
         model.train()
         running_loss = 0.0
         total = 0
 
-        for init_crop, det_crop, hist_crops, label in train_loader:
+        for init_crop, det_crop, hist_crops, label, group_id in train_loader:
             init_crop = init_crop.to(args.device)
             det_crop = det_crop.to(args.device)
             hist_crops = hist_crops.to(args.device)
             label = label.to(args.device)
+            group_id = group_id.to(args.device)
 
             optimizer.zero_grad()
             logits = model(init_crop, det_crop, hist_crops, return_attention=False)
-            loss = criterion(logits, label)
+            loss = compute_objective_loss(
+                args.objective,
+                logits,
+                label,
+                group_id,
+                bce_criterion,
+                args.ranking_margin,
+                args.ranking_weight,
+            )
             loss.backward()
             optimizer.step()
 
@@ -293,7 +551,16 @@ def main():
             total += det_crop.size(0)
 
         train_loss = running_loss / max(total, 1)
-        val_loss, val_acc = evaluate(model, val_loader, criterion, args.device)
+        val_loss, val_acc = evaluate(
+            model,
+            val_loader,
+            bce_criterion,
+            args.device,
+            args.objective,
+            args.ranking_margin,
+            args.ranking_weight,
+        )
+        epoch_time = time.perf_counter() - epoch_start
 
         ckpt = {
             "epoch": epoch,
@@ -301,14 +568,24 @@ def main():
             "image_height": args.image_height,
             "image_width": args.image_width,
             "patch_size": args.patch_size,
-            "hidden_dim": args.hidden_dim,
-            "num_heads": args.num_heads,
+            "hidden_dim": model.hidden_dim,
+            "num_heads": model.num_heads,
+            "num_stages": model.num_stages,
+            "stage_dims": model.stage_dims,
+            "stage_heads": model.stage_heads,
+            "stage_depths": model.stage_depths,
+            "stage_kernels": model.stage_kernels,
+            "stage_strides": model.stage_strides,
             "history_len": len(history_indices),
             "history_indices": history_indices,
             "keep_aspect_ratio": not args.no_keep_aspect_ratio,
+            "objective": args.objective,
+            "ranking_margin": args.ranking_margin,
+            "ranking_weight": args.ranking_weight,
             "train_loss": train_loss,
             "val_loss": val_loss,
             "val_acc": val_acc,
+            "epoch_time_sec": epoch_time,
         }
         torch.save(ckpt, save_dir / f"epoch_{epoch:03d}.pt")
 
@@ -319,6 +596,7 @@ def main():
 
         print(
             f"Epoch {epoch:03d} | "
+            f"time={epoch_time:.1f}s | "
             f"train_loss={train_loss:.4f} | "
             f"val_loss={val_loss:.4f} | "
             f"val_acc={val_acc:.4f}"
