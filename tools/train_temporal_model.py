@@ -243,7 +243,7 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--num_heads", type=int, default=4)
-    parser.add_argument("--num_stages", type=int, default=3, choices=[1, 2, 3])
+    parser.add_argument("--num_stages", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument(
         "--stage_dims",
         type=str,
@@ -568,14 +568,9 @@ def main():
             "image_height": args.image_height,
             "image_width": args.image_width,
             "patch_size": args.patch_size,
-            "hidden_dim": model.hidden_dim,
-            "num_heads": model.num_heads,
-            "num_stages": model.num_stages,
-            "stage_dims": model.stage_dims,
-            "stage_heads": model.stage_heads,
-            "stage_depths": model.stage_depths,
-            "stage_kernels": model.stage_kernels,
-            "stage_strides": model.stage_strides,
+            "hidden_dim": args.hidden_dim,
+            "num_heads": args.num_heads,
+            "num_stages": args.num_stages,
             "history_len": len(history_indices),
             "history_indices": history_indices,
             "keep_aspect_ratio": not args.no_keep_aspect_ratio,
