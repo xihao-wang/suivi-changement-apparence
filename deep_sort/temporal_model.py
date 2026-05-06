@@ -1,73 +1,138 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class TemporalAttentionScorer(nn.Module):
-    """Temporal scorer placeholder.
+    """Feature-level temporal scorer with short/long memory split.
 
-    The previous prototype attention logic has been removed.  The replacement
-    architecture should be added step by step so the implementation matches the
-    design being tested.
+    The scorer keeps the current detector / tracker pipeline intact and only
+    restructures the temporal branch:
+
+    - short-term memory encoder:
+      current detection queries the recent matched-detection history
+    - long-term memory encoder:
+      a dedicated learnable query aggregates a sparse long memory
+    - long-term gate:
+      the long-term summary is down-weighted when it conflicts with the
+      current observation
+    - fusion scorer:
+      combines current / short / gated-long representations into the final
+      matching score
 
     Inputs
     ------
     det_feat:
         Tensor of shape (B, F), the current detection feature.
     hist_feat:
-        Tensor of shape (B, T, F), the ordered matched-detection history features.
-        A typical setting is T=3 with [df_t, df_{t-i}, df_{t-2i}].
-
-    Outputs
-    -------
-    score:
-        Tensor of shape (B,), a scalar matching score per pair.
-    attn:
-        Not implemented until the next temporal attention design is added.
+        Tensor of shape (B, Ts, F), ordered recent history features used by the
+        short-term branch. A typical setting is Ts=3 with
+        [df_t, df_{t-i}, df_{t-2i}].
+    long_hist_feat:
+        Optional tensor of shape (B, Tl, F), sparse long-term memory features.
+        If omitted, the scorer falls back to a lightweight proxy built from
+        hist_feat so the training pipeline remains usable without new labels.
     """
 
-    def __init__(self, feature_dim, hidden_dim=256, num_heads=4, dropout=0.0, history_len=3):
+    def __init__(
+        self,
+        feature_dim,
+        hidden_dim=256,
+        num_heads=4,
+        dropout=0.0,
+        history_len=3,
+        long_history_len=3,
+    ):
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
         if history_len < 2:
             raise ValueError("history_len must be at least 2")
+        if long_history_len < 1:
+            raise ValueError("long_history_len must be at least 1")
 
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.dropout = dropout
         self.history_len = history_len
+        self.long_history_len = long_history_len
+
         self.input_proj = nn.Linear(feature_dim, hidden_dim)
-        self.history_pos_embed = nn.Parameter(torch.randn(1, history_len, hidden_dim) * 0.02)
-        # Explicitly encode temporal distance:
-        # df_t -> 0 step ago, df_t-i -> 1 step ago, ...
-        self.temporal_scale_embed = nn.Parameter(torch.randn(1, history_len, hidden_dim) * 0.02)
-        # Explicitly encode token role:
-        # slot 0 is the most recent history token, the remaining slots are older history.
-        self.history_type_embed = nn.Parameter(torch.randn(1, history_len, hidden_dim) * 0.02)
-        self.det_attention = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
+
+        self.short_pos_embed = nn.Parameter(
+            torch.randn(1, history_len, hidden_dim) * 0.02
         )
-        self.history_attention = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
+        self.short_temporal_embed = nn.Parameter(
+            torch.randn(1, history_len, hidden_dim) * 0.02
         )
-        self.history_query_norm = nn.LayerNorm(hidden_dim)
-        self.history_kv_norm = nn.LayerNorm(hidden_dim)
-        self.output_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.output_norm = nn.LayerNorm(hidden_dim)
-        self.scorer = nn.Sequential(
-            nn.Linear(hidden_dim * (2 + history_len) + history_len, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
+        self.short_type_embed = nn.Parameter(
+            torch.randn(1, history_len, hidden_dim) * 0.02
         )
 
-    def _validate_inputs(self, det_feat, hist_feat):
+        self.long_pos_embed = nn.Parameter(
+            torch.randn(1, long_history_len, hidden_dim) * 0.02
+        )
+        self.long_temporal_embed = nn.Parameter(
+            torch.randn(1, long_history_len, hidden_dim) * 0.02
+        )
+        self.long_type_embed = nn.Parameter(
+            torch.randn(1, long_history_len, hidden_dim) * 0.02
+        )
+        self.long_query_token = nn.Parameter(
+            torch.randn(1, 1, hidden_dim) * 0.02
+        )
+
+        self.short_attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.long_attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.det_norm = nn.LayerNorm(hidden_dim)
+        self.short_query_norm = nn.LayerNorm(hidden_dim)
+        self.short_kv_norm = nn.LayerNorm(hidden_dim)
+        self.long_query_norm = nn.LayerNorm(hidden_dim)
+        self.long_kv_norm = nn.LayerNorm(hidden_dim)
+
+        self.short_out = nn.Linear(hidden_dim, hidden_dim)
+        self.long_out = nn.Linear(hidden_dim, hidden_dim)
+        self.short_out_norm = nn.LayerNorm(hidden_dim)
+        self.long_out_norm = nn.LayerNorm(hidden_dim)
+
+        gate_hidden = max(hidden_dim // 2, 64)
+        self.long_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 3 + 2, gate_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(gate_hidden, 1),
+        )
+
+        fusion_in_dim = hidden_dim * 3 + 5
+        self.fusion = nn.Sequential(
+            nn.Linear(fusion_in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.scorer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+        self.last_long_gate = None
+        self.last_short_similarity = None
+        self.last_long_similarity = None
+        self.last_long_attention = None
+
+    def _validate_inputs(self, det_feat, hist_feat, long_hist_feat):
         if det_feat.dim() != 2:
             raise ValueError(
                 f"det_feat must have shape (B, F), got {tuple(det_feat.shape)}"
@@ -84,184 +149,202 @@ class TemporalAttentionScorer(nn.Module):
                 f"expected {self.feature_dim}, got det={det_feat.size(-1)} "
                 f"hist={hist_feat.size(-1)}"
             )
-
         if hist_feat.size(1) < self.history_len:
             raise ValueError(
                 f"hist_feat must have at least {self.history_len} ordered states, got {hist_feat.size(1)}"
             )
+        if long_hist_feat is not None:
+            if long_hist_feat.dim() != 3:
+                raise ValueError(
+                    f"long_hist_feat must have shape (B, T, F), got {tuple(long_hist_feat.shape)}"
+                )
+            if long_hist_feat.size(0) != det_feat.size(0):
+                raise ValueError("long_hist_feat must share the same batch size")
+            if long_hist_feat.size(-1) != self.feature_dim:
+                raise ValueError(
+                    f"long_hist_feat feature dim mismatch: expected {self.feature_dim}, got {long_hist_feat.size(-1)}"
+                )
+            if long_hist_feat.size(1) < self.long_history_len:
+                raise ValueError(
+                    f"long_hist_feat must have at least {self.long_history_len} states, got {long_hist_feat.size(1)}"
+                )
 
-    def build_input_tokens(self, det_feat, hist_feat):
-        """Project raw feature tokens into the hidden attention space.
+    def _build_long_proxy(self, hist_feat):
+        # Oldest -> newest ordering gives the long branch a slower, coarser
+        # temporal view even when no dedicated long-term memory is available.
+        reversed_hist = torch.flip(hist_feat[:, : self.history_len, :], dims=[1])
+        if reversed_hist.size(1) >= self.long_history_len:
+            return reversed_hist[:, : self.long_history_len, :]
+        pad_count = self.long_history_len - reversed_hist.size(1)
+        pad = reversed_hist[:, -1:, :].expand(-1, pad_count, -1)
+        return torch.cat([reversed_hist, pad], dim=1)
 
-        Feature-level mapping used for MOT matching:
-        - template/reference token: prototype built from history
-        - current query token: det_feat
-        - temporal memory tokens: the first history_len ordered states
+    def build_input_tokens(self, det_feat, hist_feat, long_hist_feat=None):
+        self._validate_inputs(det_feat, hist_feat, long_hist_feat)
+        if long_hist_feat is None:
+            long_hist_feat = self._build_long_proxy(hist_feat)
 
-        With nn.MultiheadAttention, Q/K/V projections are created internally
-        from the query/key/value inputs passed to each attention branch.
-        """
-        self._validate_inputs(det_feat, hist_feat)
+        det_token = self.input_proj(det_feat)
 
-        # Use a stable feature-level prototype as the template/reference token.
-        prototype_feat = hist_feat[:, : self.history_len, :].mean(dim=1)
-        template_token = self.input_proj(prototype_feat).unsqueeze(1)
-        query_token = self.input_proj(det_feat).unsqueeze(1)
-        history_tokens = self.input_proj(hist_feat[:, : self.history_len, :])
-        history_tokens = (
-            history_tokens
-            + self.history_pos_embed
-            + self.temporal_scale_embed
-            + self.history_type_embed
+        short_tokens = self.input_proj(hist_feat[:, : self.history_len, :])
+        short_tokens = (
+            short_tokens
+            + self.short_pos_embed
+            + self.short_temporal_embed
+            + self.short_type_embed
         )
-        return template_token, query_token, history_tokens
 
-    def build_det_self_attention(
-        self, det_feat, hist_feat, input_tokens=None, return_attention=True
+        long_tokens = self.input_proj(long_hist_feat[:, : self.long_history_len, :])
+        long_tokens = (
+            long_tokens
+            + self.long_pos_embed
+            + self.long_temporal_embed
+            + self.long_type_embed
+        )
+        return det_token, short_tokens, long_tokens
+
+    def encode_short_memory(
+        self,
+        det_feat,
+        hist_feat,
+        long_hist_feat=None,
+        input_tokens=None,
+        return_attention=True,
     ):
-        """Apply the formula-4 Attention_t pattern to the reference token.
-
-        In the original paper, Attention_t is applied to the initial template.
-        Here the template/reference role is assigned to a prototype built from
-        the recent matched-detection history.
-        """
         if input_tokens is None:
-            input_tokens = self.build_input_tokens(det_feat, hist_feat)
-        template_token, _, _ = input_tokens
+            input_tokens = self.build_input_tokens(det_feat, hist_feat, long_hist_feat)
+        det_token, short_tokens, _ = input_tokens
+        short_query = self.short_query_norm(det_token.unsqueeze(1))
+        short_kv = self.short_kv_norm(short_tokens)
 
-        template_context, template_attn = self.det_attention(
-            template_token,
-            template_token,
-            template_token,
+        short_context, short_attn = self.short_attention(
+            short_query,
+            short_kv,
+            short_kv,
             need_weights=return_attention,
             average_attn_weights=False,
         )
-
+        short_vec = self.short_out_norm(
+            self.short_out(short_context.squeeze(1)) + 0.1 * det_token
+        )
         if return_attention:
-            return template_context, template_attn
-        return template_context
+            return short_vec, short_attn
+        return short_vec
 
-    def build_history_attention(
-        self, det_feat, hist_feat, input_tokens=None, return_attention=True
+    def encode_long_memory(
+        self,
+        det_feat,
+        hist_feat,
+        long_hist_feat=None,
+        input_tokens=None,
+        return_attention=True,
     ):
-        """Apply the formula-4 Attention_s pattern to history tokens.
-
-        Feature-level mapping of the paper's notation:
-        - q_s1: Q of det_feat
-        - the template/reference branch is handled separately by the prototype
-        - k_s1...k_sn and v_s1...v_sn: K/V of the first history_len ordered states
-
-        This keeps the asymmetric matching structure:
-        the current detection query attends to the candidate track history.
-        """
         if input_tokens is None:
-            input_tokens = self.build_input_tokens(det_feat, hist_feat)
-        _, query_token, history_tokens = input_tokens
-        query_token = self.history_query_norm(query_token)
-        history_tokens = self.history_kv_norm(history_tokens)
+            input_tokens = self.build_input_tokens(det_feat, hist_feat, long_hist_feat)
+        _, _, long_tokens = input_tokens
+        batch_size = long_tokens.size(0)
+        long_query = self.long_query_token.expand(batch_size, -1, -1)
+        long_query = self.long_query_norm(long_query)
+        long_kv = self.long_kv_norm(long_tokens)
 
-        history_context, history_attn = self.history_attention(
-            query_token,
-            history_tokens,
-            history_tokens,
+        long_context, long_attn = self.long_attention(
+            long_query,
+            long_kv,
+            long_kv,
             need_weights=return_attention,
             average_attn_weights=False,
         )
-
-        if return_attention:
-            return history_context, history_attn, history_tokens
-        return history_context
-
-    def build_projected_tokens(self, det_feat, hist_feat, return_attention=True):
-        """Concatenate attention branches and apply output projection.
-
-        This corresponds to the C + Linear Projection + residual part after
-        formula-4 attention operations.  The output token order is:
-        [reference(df_t), current_query(det_feat)].
-        """
-        input_tokens = self.build_input_tokens(det_feat, hist_feat)
-        template_token, query_token, _ = input_tokens
-        branch_inputs = torch.cat([template_token, query_token], dim=1)
-
-        template_context, template_attn = self.build_det_self_attention(
-            det_feat, hist_feat, input_tokens=input_tokens, return_attention=True
+        long_vec = self.long_out_norm(
+            self.long_out(long_context.squeeze(1)) + 0.1 * self.long_query_token.squeeze(0)
         )
-        history_context, history_attn, history_tokens = self.build_history_attention(
-            det_feat, hist_feat, input_tokens=input_tokens, return_attention=True
-        )
+        if return_attention:
+            return long_vec, long_attn
+        return long_vec
 
-        attention_tokens = torch.cat([template_context, history_context], dim=1)
-        projected_tokens = self.output_proj(attention_tokens)
-        output_tokens = self.output_norm(projected_tokens + 0.1 * branch_inputs)
-        # output_tokens = self.output_norm(projected_tokens)
+    def _compute_long_gate(self, det_vec, short_vec, long_vec):
+        det_unit = F.normalize(det_vec, dim=-1)
+        short_unit = F.normalize(short_vec, dim=-1)
+        long_unit = F.normalize(long_vec, dim=-1)
 
+        sim_short = (det_unit * short_unit).sum(dim=-1, keepdim=True)
+        sim_long = (det_unit * long_unit).sum(dim=-1, keepdim=True)
+        gate_input = torch.cat([det_vec, short_vec, long_vec, sim_short, sim_long], dim=-1)
+        long_gate = torch.sigmoid(self.long_gate(gate_input))
+        return long_gate, sim_short, sim_long
+
+    def forward(self, det_feat, hist_feat, long_hist_feat=None, return_attention=True):
+        input_tokens = self.build_input_tokens(det_feat, hist_feat, long_hist_feat)
+        det_vec = self.det_norm(input_tokens[0])
 
         if return_attention:
-            return output_tokens, template_attn, history_attn, history_tokens
-        return output_tokens
-
-    def forward(self, det_feat, hist_feat, return_attention=True):
-        if return_attention:
-            output_tokens, _, history_attn, history_tokens = self.build_projected_tokens(
-                det_feat, hist_feat, return_attention=True
+            short_vec, short_attn = self.encode_short_memory(
+                det_feat,
+                hist_feat,
+                long_hist_feat=long_hist_feat,
+                input_tokens=input_tokens,
+                return_attention=True,
+            )
+            long_vec, long_attn = self.encode_long_memory(
+                det_feat,
+                hist_feat,
+                long_hist_feat=long_hist_feat,
+                input_tokens=input_tokens,
+                return_attention=True,
             )
         else:
-            output_tokens = self.build_projected_tokens(
-                det_feat, hist_feat, return_attention=False
+            short_vec = self.encode_short_memory(
+                det_feat,
+                hist_feat,
+                long_hist_feat=long_hist_feat,
+                input_tokens=input_tokens,
+                return_attention=False,
             )
+            long_vec = self.encode_long_memory(
+                det_feat,
+                hist_feat,
+                long_hist_feat=long_hist_feat,
+                input_tokens=input_tokens,
+                return_attention=False,
+            )
+            short_attn = None
+            long_attn = None
 
-        template_output = output_tokens[:, 0, :]
-        query_output = output_tokens[:, 1, :]
-        if return_attention:
-            attn_mean = history_attn.mean(dim=1).squeeze(1)
-            per_history_contrib = attn_mean.unsqueeze(-1) * history_tokens
-            fused = torch.cat(
-                [template_output, query_output]
-                + [per_history_contrib[:, i, :] for i in range(self.history_len)]
-                + [attn_mean],
-                dim=-1,
-            )
-        else:
-            # Recompute the minimal history path needed by the scorer without
-            # returning attention tensors to the caller.
-            _, query_token, history_tokens = self.build_input_tokens(det_feat, hist_feat)
-            query_token = self.history_query_norm(query_token)
-            history_tokens = self.history_kv_norm(history_tokens)
-            _, history_attn = self.history_attention(
-                query_token,
-                history_tokens,
-                history_tokens,
-                need_weights=True,
-                average_attn_weights=False,
-            )
-            attn_mean = history_attn.mean(dim=1).squeeze(1)
-            per_history_contrib = attn_mean.unsqueeze(-1) * history_tokens
-            fused = torch.cat(
-                [template_output, query_output]
-                + [per_history_contrib[:, i, :] for i in range(self.history_len)]
-                + [attn_mean],
-                dim=-1,
-            )
+        long_gate, sim_short, sim_long = self._compute_long_gate(det_vec, short_vec, long_vec)
+        gated_long_vec = long_gate * long_vec
+
+        fusion_input = torch.cat(
+            [
+                det_vec,
+                short_vec,
+                gated_long_vec,
+                long_gate,
+                sim_short,
+                sim_long,
+                sim_short - sim_long,
+                (short_vec * gated_long_vec).mean(dim=-1, keepdim=True),
+            ],
+            dim=-1,
+        )
+        fused = self.fusion(fusion_input)
         score = self.scorer(fused).squeeze(-1)
 
+        self.last_long_gate = long_gate.detach()
+        self.last_short_similarity = sim_short.detach()
+        self.last_long_similarity = sim_long.detach()
+        self.last_long_attention = None if long_attn is None else long_attn.detach()
+
         if return_attention:
-            return score, history_attn
+            return score, short_attn
         return score
 
 
 def build_temporal_input(det_feat, df_t, df_t_i, df_t_2i):
-    """Build the ordered temporal input tensor.
-
-    Parameters
-    ----------
-    det_feat : Tensor, shape (B, F)
-    df_t : Tensor, shape (B, F)
-    df_t_i : Tensor, shape (B, F)
-    df_t_2i : Tensor, shape (B, F)
+    """Build the ordered short-term temporal input tensor.
 
     Returns
     -------
     hist_feat : Tensor, shape (B, 3, F)
+        Ordered as [df_t, df_t-i, df_t-2i].
     """
     if not (det_feat.dim() == df_t.dim() == df_t_i.dim() == df_t_2i.dim() == 2):
         raise ValueError("all input features must have shape (B, F)")

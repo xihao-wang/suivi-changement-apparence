@@ -82,13 +82,20 @@ def build_reports(
     learned_temporal_model = None
     if enable_learned_temporal:
         feature_dim = seq_info["detections"].shape[1] - 10
+        ckpt_long_history_len = 3
+        if temporal_model_ckpt:
+            ckpt = torch.load(temporal_model_ckpt, map_location="cpu")
+            if isinstance(ckpt, dict):
+                ckpt_long_history_len = int(ckpt.get("long_history_len", 3))
+            else:
+                ckpt = {"state_dict": ckpt}
         learned_temporal_model = TemporalAttentionScorer(
             feature_dim=feature_dim,
             hidden_dim=temporal_hidden_dim,
             num_heads=temporal_num_heads,
+            long_history_len=ckpt_long_history_len,
         )
         if temporal_model_ckpt:
-            ckpt = torch.load(temporal_model_ckpt, map_location="cpu")
             state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
             learned_temporal_model.load_state_dict(state_dict, strict=False)
         learned_temporal_model.eval()
@@ -229,7 +236,30 @@ def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stri
 
     det_batch = []
     hist_batch = []
+    long_hist_batch = []
     pair_indices = []
+
+    def _build_long_history(track):
+        long_history_len = getattr(model, "long_history_len", 3)
+        long_memory = getattr(track, "long_memory", [])
+        if len(long_memory) >= long_history_len:
+            sample_idx = np.linspace(
+                0, len(long_memory) - 1, num=long_history_len, dtype=int
+            )
+            return np.stack(
+                [np.asarray(long_memory[idx], dtype=np.float32) for idx in sample_idx],
+                axis=0,
+            )
+        history = getattr(track, "det_feat_history", [])
+        if len(history) >= long_history_len:
+            sample_idx = np.linspace(
+                0, len(history) - 1, num=long_history_len, dtype=int
+            )
+            return np.stack(
+                [np.asarray(history[idx], dtype=np.float32) for idx in sample_idx],
+                axis=0,
+            )
+        return None
 
     for i, track in enumerate(candidate_tracks):
         if len(getattr(track, "det_feat_history", [])) < 2 * stride + 1:
@@ -237,6 +267,9 @@ def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stri
         df_t = np.asarray(track.det_feat_history[-1], dtype=np.float32)
         df_t_i = np.asarray(track.det_feat_history[-1 - stride], dtype=np.float32)
         df_t_2i = np.asarray(track.det_feat_history[-1 - 2 * stride], dtype=np.float32)
+        long_hist = _build_long_history(track)
+        if long_hist is None:
+            long_hist = np.stack([df_t_2i, df_t_i, df_t], axis=0)
         for j, det in enumerate(detections):
             det_feat = np.asarray(det.feature, dtype=np.float32)
             det_norm = np.linalg.norm(det_feat)
@@ -244,6 +277,7 @@ def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stri
                 det_feat = det_feat / det_norm
             det_batch.append(det_feat)
             hist_batch.append(np.stack([df_t, df_t_i, df_t_2i], axis=0))
+            long_hist_batch.append(long_hist)
             pair_indices.append((i, j))
 
     if not pair_indices:
@@ -251,9 +285,15 @@ def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stri
 
     det_tensor = torch.from_numpy(np.stack(det_batch, axis=0))
     hist_tensor = torch.from_numpy(np.stack(hist_batch, axis=0))
+    long_hist_tensor = torch.from_numpy(np.stack(long_hist_batch, axis=0))
 
     with torch.no_grad():
-        score_tensor, attn_tensor = model(det_tensor, hist_tensor, return_attention=True)
+        score_tensor, attn_tensor = model(
+            det_tensor,
+            hist_tensor,
+            long_hist_feat=long_hist_tensor,
+            return_attention=True,
+        )
 
     scores = score_tensor.detach().cpu().numpy()
     attn = attn_tensor.detach().cpu().numpy().mean(axis=1).squeeze(1)  # (B, 3)

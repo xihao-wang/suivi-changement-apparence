@@ -88,6 +88,12 @@ class Track:
         self.prot_short = None
         self.prot_long = None
         self.prototype = None
+        self.phase_change_score = 0.0
+        self.phase_stability_score = 0.0
+        self.phase_candidate_count = 0
+        self.long_memory_reset_count = 0
+        self.last_phase_reset_hit = -10**9
+        self.current_phase_start_hit = 1
         if feature is not None:
             self.det_feat_history.append(feature.copy())
             if opt.enable_stm_ltm:
@@ -117,6 +123,61 @@ class Track:
         if norm < 1e-12:
             return None
         return vec / norm
+
+    def _short_memory_consistency(self):
+        if self.prot_short is None or len(self.short_memory) < 2:
+            return 1.0
+        sims = [float(np.dot(self.prot_short, feat)) for feat in self.short_memory]
+        return float(np.mean(sims))
+
+    def _rebuild_long_memory_from_short_phase(self):
+        if len(self.short_memory) == 0:
+            return
+        self.long_memory = [feat.copy() for feat in self.short_memory]
+        self.current_phase_start_hit = max(1, self.hits - len(self.short_memory) + 1)
+        self.last_phase_reset_hit = self.hits
+        self.long_memory_reset_count += 1
+        self.phase_candidate_count = 0
+
+    def _maybe_truncate_long_memory(self, feature):
+        self.phase_change_score = 0.0
+        self.phase_stability_score = 0.0
+
+        if not opt.enable_phase_truncation:
+            self.phase_candidate_count = 0
+            return
+        if self.prot_long is None:
+            self.phase_candidate_count = 0
+            return
+        if len(self.long_memory) < opt.phase_min_long_memory:
+            self.phase_candidate_count = 0
+            return
+        if len(self.short_memory) < opt.phase_min_short_memory:
+            self.phase_candidate_count = 0
+            return
+        if self.hits - self.last_phase_reset_hit < opt.phase_reset_cooldown:
+            self.phase_candidate_count = 0
+            return
+
+        sim_old = float(np.dot(self.prot_long, feature))
+        sim_short = float(np.dot(self.prot_short, feature)) if self.prot_short is not None else 1.0
+        short_consistency = self._short_memory_consistency()
+
+        self.phase_change_score = max(0.0, opt.phase_old_sim_threshold - sim_old)
+        self.phase_stability_score = 0.5 * (sim_short + short_consistency)
+
+        stable_new_phase = (
+            sim_old < opt.phase_old_sim_threshold and
+            sim_short > opt.phase_short_sim_threshold and
+            short_consistency > opt.phase_consistency_threshold
+        )
+        if stable_new_phase:
+            self.phase_candidate_count += 1
+        else:
+            self.phase_candidate_count = 0
+
+        if self.phase_candidate_count >= opt.phase_patience:
+            self._rebuild_long_memory_from_short_phase()
 
     def to_tlwh(self):
         """Get current position in bounding box format `(top left x, top left y,
@@ -240,6 +301,8 @@ class Track:
             self.long_memory.append(feature)
             if len(self.long_memory) > opt.long_memory_size:
                 self.long_memory.pop(0)
+
+        self._maybe_truncate_long_memory(feature)
 
         if len(self.long_memory) > 0:
             self.prot_long = np.mean(self.long_memory, axis=0)

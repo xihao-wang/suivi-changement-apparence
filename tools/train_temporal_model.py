@@ -20,9 +20,15 @@ from deep_sort.temporal_model import TemporalAttentionScorer
 
 
 class TemporalPairDataset(Dataset):
-    def __init__(self, npz_path: str, history_indices: list[int] | None = None):
+    def __init__(
+        self,
+        npz_path: str,
+        history_indices: list[int] | None = None,
+        long_history_len: int = 3,
+    ):
         data = np.load(npz_path)
         self.history_indices = history_indices or [0, 1, 2]
+        self.long_history_len = long_history_len
         self.det_feat = data["det_feat"].astype(np.float32)
         self.df_t = data["df_t"].astype(np.float32) if "df_t" in data else data["p_t"].astype(np.float32)
         self.df_t_i = data["df_t_i"].astype(np.float32) if "df_t_i" in data else data["p_t_i"].astype(np.float32)
@@ -37,15 +43,24 @@ class TemporalPairDataset(Dataset):
         history_pool = [self.df_t[idx], self.df_t_i[idx], self.df_t_2i[idx]]
         hist_items = [history_pool[i] for i in self.history_indices]
         hist = torch.from_numpy(np.stack(hist_items, axis=0))
+        long_pool = [self.df_t_2i[idx], self.df_t_i[idx], self.df_t[idx]]
+        long_items = long_pool[: self.long_history_len]
+        long_hist = torch.from_numpy(np.stack(long_items, axis=0))
         label = torch.tensor(self.label[idx], dtype=torch.float32)
-        return det, hist, label
+        return det, hist, long_hist, label
 
 
 class MultiTemporalPairDataset(Dataset):
-    def __init__(self, npz_paths: list[str], history_indices: list[int] | None = None):
+    def __init__(
+        self,
+        npz_paths: list[str],
+        history_indices: list[int] | None = None,
+        long_history_len: int = 3,
+    ):
         if not npz_paths:
             raise ValueError("npz_paths must not be empty")
         self.history_indices = history_indices or [0, 1, 2]
+        self.long_history_len = long_history_len
 
         det_feats = []
         df_ts = []
@@ -89,8 +104,11 @@ class MultiTemporalPairDataset(Dataset):
         history_pool = [self.df_t[idx], self.df_t_i[idx], self.df_t_2i[idx]]
         hist_items = [history_pool[i] for i in self.history_indices]
         hist = torch.from_numpy(np.stack(hist_items, axis=0))
+        long_pool = [self.df_t_2i[idx], self.df_t_i[idx], self.df_t[idx]]
+        long_items = long_pool[: self.long_history_len]
+        long_hist = torch.from_numpy(np.stack(long_items, axis=0))
         label = torch.tensor(self.label[idx], dtype=torch.float32)
-        return det, hist, label
+        return det, hist, long_hist, label
 
 
 def parse_args():
@@ -106,6 +124,7 @@ def parse_args():
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--num_heads", type=int, default=4)
     parser.add_argument("--history_len", type=int, default=3, choices=[2, 3])
+    parser.add_argument("--long_history_len", type=int, default=3, choices=[1, 2, 3])
     parser.add_argument(
         "--history_indices",
         type=str,
@@ -136,11 +155,12 @@ def evaluate(model, loader, criterion, device):
     total = 0
     correct = 0
     with torch.no_grad():
-        for det, hist, label in loader:
+        for det, hist, long_hist, label in loader:
             det = det.to(device)
             hist = hist.to(device)
+            long_hist = long_hist.to(device)
             label = label.to(device)
-            logits = model(det, hist, return_attention=False)
+            logits = model(det, hist, long_hist_feat=long_hist, return_attention=False)
             loss = criterion(logits, label)
             total_loss += float(loss.item()) * det.size(0)
             probs = torch.sigmoid(logits)
@@ -162,8 +182,16 @@ def main():
     if use_explicit_split:
         if not args.train_pair_npz or not args.val_pair_npz:
             raise ValueError("When using explicit split, both --train_pair_npz and --val_pair_npz must be provided")
-        train_set = MultiTemporalPairDataset(args.train_pair_npz, history_indices=history_indices)
-        val_set = MultiTemporalPairDataset(args.val_pair_npz, history_indices=history_indices)
+        train_set = MultiTemporalPairDataset(
+            args.train_pair_npz,
+            history_indices=history_indices,
+            long_history_len=args.long_history_len,
+        )
+        val_set = MultiTemporalPairDataset(
+            args.val_pair_npz,
+            history_indices=history_indices,
+            long_history_len=args.long_history_len,
+        )
         if len(train_set) == 0:
             raise ValueError("Empty training pair dataset")
         if len(val_set) == 0:
@@ -177,7 +205,11 @@ def main():
     else:
         if not args.pair_npz:
             raise ValueError("Provide --pair_npz or both --train_pair_npz and --val_pair_npz")
-        dataset = TemporalPairDataset(args.pair_npz, history_indices=history_indices)
+        dataset = TemporalPairDataset(
+            args.pair_npz,
+            history_indices=history_indices,
+            long_history_len=args.long_history_len,
+        )
         if len(dataset) == 0:
             raise ValueError("Empty pair dataset")
 
@@ -199,6 +231,7 @@ def main():
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
         history_len=len(history_indices),
+        long_history_len=args.long_history_len,
     ).to(args.device)
 
     num_pos = float(labels.sum())
@@ -222,13 +255,14 @@ def main():
         running_loss = 0.0
         total = 0
 
-        for det, hist, label in train_loader:
+        for det, hist, long_hist, label in train_loader:
             det = det.to(args.device)
             hist = hist.to(args.device)
+            long_hist = long_hist.to(args.device)
             label = label.to(args.device)
 
             optimizer.zero_grad()
-            logits = model(det, hist, return_attention=False)
+            logits = model(det, hist, long_hist_feat=long_hist, return_attention=False)
             loss = criterion(logits, label)
             loss.backward()
             optimizer.step()
@@ -246,6 +280,7 @@ def main():
             "hidden_dim": args.hidden_dim,
             "num_heads": args.num_heads,
             "history_len": len(history_indices),
+            "long_history_len": args.long_history_len,
             "history_indices": history_indices,
             "train_loss": train_loss,
             "val_loss": val_loss,
