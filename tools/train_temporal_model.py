@@ -23,58 +23,79 @@ class TemporalPairDataset(Dataset):
     def __init__(
         self,
         npz_path: str,
-        history_indices: list[int] | None = None,
-        long_history_len: int = 3,
+        history_len: int = 5,
+        long_history_len: int = 30,
     ):
         data = np.load(npz_path)
-        self.history_indices = history_indices or [0, 1, 2]
+        required = {"det_feat", "short_hist_feat", "long_hist_feat", "short_hist_len", "long_hist_len", "label"}
+        missing = sorted(required.difference(data.files))
+        if missing:
+            raise ValueError(
+                f"{npz_path} is missing required fields for the memory schema: {missing}"
+            )
+        self.history_len = history_len
         self.long_history_len = long_history_len
         self.det_feat = data["det_feat"].astype(np.float32)
-        self.df_t = data["df_t"].astype(np.float32) if "df_t" in data else data["p_t"].astype(np.float32)
-        self.df_t_i = data["df_t_i"].astype(np.float32) if "df_t_i" in data else data["p_t_i"].astype(np.float32)
-        self.df_t_2i = data["df_t_2i"].astype(np.float32) if "df_t_2i" in data else data["p_t_2i"].astype(np.float32)
+        self.short_hist_feat = data["short_hist_feat"].astype(np.float32)
+        self.long_hist_feat = data["long_hist_feat"].astype(np.float32)
+        self.short_hist_len = data["short_hist_len"].astype(np.int64)
+        self.long_hist_len = data["long_hist_len"].astype(np.int64)
         self.label = data["label"].astype(np.float32)
+        if self.short_hist_feat.shape[1] != self.history_len:
+            raise ValueError(
+                f"{npz_path} short_hist_feat has length {self.short_hist_feat.shape[1]}, expected {self.history_len}"
+            )
+        if self.long_hist_feat.shape[1] != self.long_history_len:
+            raise ValueError(
+                f"{npz_path} long_hist_feat has length {self.long_hist_feat.shape[1]}, expected {self.long_history_len}"
+            )
 
     def __len__(self):
         return len(self.label)
 
     def __getitem__(self, idx):
         det = torch.from_numpy(self.det_feat[idx])
-        history_pool = [self.df_t[idx], self.df_t_i[idx], self.df_t_2i[idx]]
-        hist_items = [history_pool[i] for i in self.history_indices]
-        hist = torch.from_numpy(np.stack(hist_items, axis=0))
-        long_pool = [self.df_t_2i[idx], self.df_t_i[idx], self.df_t[idx]]
-        long_items = long_pool[: self.long_history_len]
-        long_hist = torch.from_numpy(np.stack(long_items, axis=0))
+        hist = torch.from_numpy(self.short_hist_feat[idx])
+        long_hist = torch.from_numpy(self.long_hist_feat[idx])
+        short_len = torch.tensor(int(self.short_hist_len[idx]), dtype=torch.long)
+        long_len = torch.tensor(int(self.long_hist_len[idx]), dtype=torch.long)
         label = torch.tensor(self.label[idx], dtype=torch.float32)
-        return det, hist, long_hist, label
+        return det, hist, long_hist, short_len, long_len, label
 
 
 class MultiTemporalPairDataset(Dataset):
     def __init__(
         self,
         npz_paths: list[str],
-        history_indices: list[int] | None = None,
-        long_history_len: int = 3,
+        history_len: int = 5,
+        long_history_len: int = 30,
     ):
         if not npz_paths:
             raise ValueError("npz_paths must not be empty")
-        self.history_indices = history_indices or [0, 1, 2]
+        self.history_len = history_len
         self.long_history_len = long_history_len
 
         det_feats = []
-        df_ts = []
-        df_t_is = []
-        df_t_2is = []
+        short_hist_feats = []
+        long_hist_feats = []
+        short_hist_lens = []
+        long_hist_lens = []
         labels = []
         feature_dim = None
 
         for npz_path in npz_paths:
             data = np.load(npz_path)
+            required = {"det_feat", "short_hist_feat", "long_hist_feat", "short_hist_len", "long_hist_len", "label"}
+            missing = sorted(required.difference(data.files))
+            if missing:
+                raise ValueError(
+                    f"{npz_path} is missing required fields for the memory schema: {missing}"
+                )
             det_feat = data["det_feat"].astype(np.float32)
-            df_t = data["df_t"].astype(np.float32) if "df_t" in data else data["p_t"].astype(np.float32)
-            df_t_i = data["df_t_i"].astype(np.float32) if "df_t_i" in data else data["p_t_i"].astype(np.float32)
-            df_t_2i = data["df_t_2i"].astype(np.float32) if "df_t_2i" in data else data["p_t_2i"].astype(np.float32)
+            short_hist_feat = data["short_hist_feat"].astype(np.float32)
+            long_hist_feat = data["long_hist_feat"].astype(np.float32)
+            short_hist_len = data["short_hist_len"].astype(np.int64)
+            long_hist_len = data["long_hist_len"].astype(np.int64)
             label = data["label"].astype(np.float32)
 
             if feature_dim is None:
@@ -83,17 +104,27 @@ class MultiTemporalPairDataset(Dataset):
                 raise ValueError(
                     f"Feature dimension mismatch: expected {feature_dim}, got {det_feat.shape[1]} from {npz_path}"
                 )
+            if short_hist_feat.shape[1] != self.history_len:
+                raise ValueError(
+                    f"{npz_path} short_hist_feat has length {short_hist_feat.shape[1]}, expected {self.history_len}"
+                )
+            if long_hist_feat.shape[1] != self.long_history_len:
+                raise ValueError(
+                    f"{npz_path} long_hist_feat has length {long_hist_feat.shape[1]}, expected {self.long_history_len}"
+                )
 
             det_feats.append(det_feat)
-            df_ts.append(df_t)
-            df_t_is.append(df_t_i)
-            df_t_2is.append(df_t_2i)
+            short_hist_feats.append(short_hist_feat)
+            long_hist_feats.append(long_hist_feat)
+            short_hist_lens.append(short_hist_len)
+            long_hist_lens.append(long_hist_len)
             labels.append(label)
 
         self.det_feat = np.concatenate(det_feats, axis=0)
-        self.df_t = np.concatenate(df_ts, axis=0)
-        self.df_t_i = np.concatenate(df_t_is, axis=0)
-        self.df_t_2i = np.concatenate(df_t_2is, axis=0)
+        self.short_hist_feat = np.concatenate(short_hist_feats, axis=0)
+        self.long_hist_feat = np.concatenate(long_hist_feats, axis=0)
+        self.short_hist_len = np.concatenate(short_hist_lens, axis=0)
+        self.long_hist_len = np.concatenate(long_hist_lens, axis=0)
         self.label = np.concatenate(labels, axis=0)
 
     def __len__(self):
@@ -101,14 +132,12 @@ class MultiTemporalPairDataset(Dataset):
 
     def __getitem__(self, idx):
         det = torch.from_numpy(self.det_feat[idx])
-        history_pool = [self.df_t[idx], self.df_t_i[idx], self.df_t_2i[idx]]
-        hist_items = [history_pool[i] for i in self.history_indices]
-        hist = torch.from_numpy(np.stack(hist_items, axis=0))
-        long_pool = [self.df_t_2i[idx], self.df_t_i[idx], self.df_t[idx]]
-        long_items = long_pool[: self.long_history_len]
-        long_hist = torch.from_numpy(np.stack(long_items, axis=0))
+        hist = torch.from_numpy(self.short_hist_feat[idx])
+        long_hist = torch.from_numpy(self.long_hist_feat[idx])
+        short_len = torch.tensor(int(self.short_hist_len[idx]), dtype=torch.long)
+        long_len = torch.tensor(int(self.long_hist_len[idx]), dtype=torch.long)
         label = torch.tensor(self.label[idx], dtype=torch.float32)
-        return det, hist, long_hist, label
+        return det, hist, long_hist, short_len, long_len, label
 
 
 def parse_args():
@@ -123,30 +152,12 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--num_heads", type=int, default=4)
-    parser.add_argument("--history_len", type=int, default=3, choices=[2, 3])
-    parser.add_argument("--long_history_len", type=int, default=3, choices=[1, 2, 3])
-    parser.add_argument(
-        "--history_indices",
-        type=str,
-        default=None,
-        help="Comma-separated selection from {0,1,2}: 0=df_t, 1=df_t-i, 2=df_t-2i. "
-             "If omitted, uses the first --history_len indices.",
-    )
+    parser.add_argument("--history_len", type=int, default=5, choices=[2, 3, 5])
+    parser.add_argument("--long_history_len", type=int, default=30)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
-
-
-def parse_history_indices(arg: str | None, history_len: int) -> list[int]:
-    if arg is None:
-        return [0, 1, 2][:history_len]
-    indices = [int(x.strip()) for x in arg.split(",") if x.strip()]
-    if not indices:
-        raise ValueError("--history_indices must not be empty")
-    if any(i not in (0, 1, 2) for i in indices):
-        raise ValueError("--history_indices values must be chosen from {0,1,2}")
-    return indices
 
 
 def evaluate(model, loader, criterion, device):
@@ -155,12 +166,21 @@ def evaluate(model, loader, criterion, device):
     total = 0
     correct = 0
     with torch.no_grad():
-        for det, hist, long_hist, label in loader:
+        for det, hist, long_hist, short_len, long_len, label in loader:
             det = det.to(device)
             hist = hist.to(device)
             long_hist = long_hist.to(device)
+            short_len = short_len.to(device)
+            long_len = long_len.to(device)
             label = label.to(device)
-            logits = model(det, hist, long_hist_feat=long_hist, return_attention=False)
+            logits = model(
+                det,
+                hist,
+                long_hist_feat=long_hist,
+                short_hist_len=short_len,
+                long_hist_len=long_len,
+                return_attention=False,
+            )
             loss = criterion(logits, label)
             total_loss += float(loss.item()) * det.size(0)
             probs = torch.sigmoid(logits)
@@ -174,7 +194,6 @@ def evaluate(model, loader, criterion, device):
 
 def main():
     args = parse_args()
-    history_indices = parse_history_indices(args.history_indices, args.history_len)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -184,12 +203,12 @@ def main():
             raise ValueError("When using explicit split, both --train_pair_npz and --val_pair_npz must be provided")
         train_set = MultiTemporalPairDataset(
             args.train_pair_npz,
-            history_indices=history_indices,
+            history_len=args.history_len,
             long_history_len=args.long_history_len,
         )
         val_set = MultiTemporalPairDataset(
             args.val_pair_npz,
-            history_indices=history_indices,
+            history_len=args.history_len,
             long_history_len=args.long_history_len,
         )
         if len(train_set) == 0:
@@ -207,7 +226,7 @@ def main():
             raise ValueError("Provide --pair_npz or both --train_pair_npz and --val_pair_npz")
         dataset = TemporalPairDataset(
             args.pair_npz,
-            history_indices=history_indices,
+            history_len=args.history_len,
             long_history_len=args.long_history_len,
         )
         if len(dataset) == 0:
@@ -230,7 +249,7 @@ def main():
         feature_dim=feature_dim,
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
-        history_len=len(history_indices),
+        history_len=args.history_len,
         long_history_len=args.long_history_len,
     ).to(args.device)
 
@@ -255,14 +274,23 @@ def main():
         running_loss = 0.0
         total = 0
 
-        for det, hist, long_hist, label in train_loader:
+        for det, hist, long_hist, short_len, long_len, label in train_loader:
             det = det.to(args.device)
             hist = hist.to(args.device)
             long_hist = long_hist.to(args.device)
+            short_len = short_len.to(args.device)
+            long_len = long_len.to(args.device)
             label = label.to(args.device)
 
             optimizer.zero_grad()
-            logits = model(det, hist, long_hist_feat=long_hist, return_attention=False)
+            logits = model(
+                det,
+                hist,
+                long_hist_feat=long_hist,
+                short_hist_len=short_len,
+                long_hist_len=long_len,
+                return_attention=False,
+            )
             loss = criterion(logits, label)
             loss.backward()
             optimizer.step()
@@ -279,9 +307,8 @@ def main():
             "feature_dim": feature_dim,
             "hidden_dim": args.hidden_dim,
             "num_heads": args.num_heads,
-            "history_len": len(history_indices),
+            "history_len": args.history_len,
             "long_history_len": args.long_history_len,
-            "history_indices": history_indices,
             "train_loss": train_loss,
             "val_loss": val_loss,
             "val_acc": val_acc,

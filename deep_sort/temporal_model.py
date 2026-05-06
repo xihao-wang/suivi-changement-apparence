@@ -12,7 +12,7 @@ class TemporalAttentionScorer(nn.Module):
     - short-term memory encoder:
       current detection queries the recent matched-detection history
     - long-term memory encoder:
-      a dedicated learnable query aggregates a sparse long memory
+      a dedicated learnable query aggregates the full long memory bank
     - long-term gate:
       the long-term summary is down-weighted when it conflicts with the
       current observation
@@ -26,10 +26,10 @@ class TemporalAttentionScorer(nn.Module):
         Tensor of shape (B, F), the current detection feature.
     hist_feat:
         Tensor of shape (B, Ts, F), ordered recent history features used by the
-        short-term branch. A typical setting is Ts=3 with
-        [df_t, df_{t-i}, df_{t-2i}].
+        short-term branch. The intended online setting is Ts=5 with the most
+        recent short-memory states ordered from newest to older observations.
     long_hist_feat:
-        Optional tensor of shape (B, Tl, F), sparse long-term memory features.
+        Optional tensor of shape (B, Tl, F), full long-term memory features.
         If omitted, the scorer falls back to a lightweight proxy built from
         hist_feat so the training pipeline remains usable without new labels.
     """
@@ -40,8 +40,8 @@ class TemporalAttentionScorer(nn.Module):
         hidden_dim=256,
         num_heads=4,
         dropout=0.0,
-        history_len=3,
-        long_history_len=3,
+        history_len=5,
+        long_history_len=30,
     ):
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -132,7 +132,17 @@ class TemporalAttentionScorer(nn.Module):
         self.last_long_similarity = None
         self.last_long_attention = None
 
-    def _validate_inputs(self, det_feat, hist_feat, long_hist_feat):
+    @staticmethod
+    def _build_key_padding_mask(lengths, max_len, device):
+        if lengths is None:
+            return None
+        if lengths.dim() != 1:
+            raise ValueError(f"length tensor must have shape (B,), got {tuple(lengths.shape)}")
+        steps = torch.arange(max_len, device=device).unsqueeze(0)
+        valid = steps < lengths.unsqueeze(1)
+        return ~valid
+
+    def _validate_inputs(self, det_feat, hist_feat, long_hist_feat, short_hist_len, long_hist_len):
         if det_feat.dim() != 2:
             raise ValueError(
                 f"det_feat must have shape (B, F), got {tuple(det_feat.shape)}"
@@ -153,6 +163,8 @@ class TemporalAttentionScorer(nn.Module):
             raise ValueError(
                 f"hist_feat must have at least {self.history_len} ordered states, got {hist_feat.size(1)}"
             )
+        if short_hist_len is not None and short_hist_len.size(0) != det_feat.size(0):
+            raise ValueError("short_hist_len must share the same batch size")
         if long_hist_feat is not None:
             if long_hist_feat.dim() != 3:
                 raise ValueError(
@@ -168,10 +180,13 @@ class TemporalAttentionScorer(nn.Module):
                 raise ValueError(
                     f"long_hist_feat must have at least {self.long_history_len} states, got {long_hist_feat.size(1)}"
                 )
+            if long_hist_len is not None and long_hist_len.size(0) != det_feat.size(0):
+                raise ValueError("long_hist_len must share the same batch size")
 
     def _build_long_proxy(self, hist_feat):
-        # Oldest -> newest ordering gives the long branch a slower, coarser
-        # temporal view even when no dedicated long-term memory is available.
+        # Training data on this branch only stores a short proxy history.
+        # Keep the interface aligned with the online 30-slot long memory by
+        # padding the oldest available state.
         reversed_hist = torch.flip(hist_feat[:, : self.history_len, :], dims=[1])
         if reversed_hist.size(1) >= self.long_history_len:
             return reversed_hist[:, : self.long_history_len, :]
@@ -179,8 +194,8 @@ class TemporalAttentionScorer(nn.Module):
         pad = reversed_hist[:, -1:, :].expand(-1, pad_count, -1)
         return torch.cat([reversed_hist, pad], dim=1)
 
-    def build_input_tokens(self, det_feat, hist_feat, long_hist_feat=None):
-        self._validate_inputs(det_feat, hist_feat, long_hist_feat)
+    def build_input_tokens(self, det_feat, hist_feat, long_hist_feat=None, short_hist_len=None, long_hist_len=None):
+        self._validate_inputs(det_feat, hist_feat, long_hist_feat, short_hist_len, long_hist_len)
         if long_hist_feat is None:
             long_hist_feat = self._build_long_proxy(hist_feat)
 
@@ -208,19 +223,29 @@ class TemporalAttentionScorer(nn.Module):
         det_feat,
         hist_feat,
         long_hist_feat=None,
+        short_hist_len=None,
         input_tokens=None,
         return_attention=True,
     ):
         if input_tokens is None:
-            input_tokens = self.build_input_tokens(det_feat, hist_feat, long_hist_feat)
+            input_tokens = self.build_input_tokens(
+                det_feat,
+                hist_feat,
+                long_hist_feat,
+                short_hist_len=short_hist_len,
+            )
         det_token, short_tokens, _ = input_tokens
         short_query = self.short_query_norm(det_token.unsqueeze(1))
         short_kv = self.short_kv_norm(short_tokens)
+        short_padding_mask = self._build_key_padding_mask(
+            short_hist_len, short_kv.size(1), short_kv.device
+        )
 
         short_context, short_attn = self.short_attention(
             short_query,
             short_kv,
             short_kv,
+            key_padding_mask=short_padding_mask,
             need_weights=return_attention,
             average_attn_weights=False,
         )
@@ -236,21 +261,31 @@ class TemporalAttentionScorer(nn.Module):
         det_feat,
         hist_feat,
         long_hist_feat=None,
+        long_hist_len=None,
         input_tokens=None,
         return_attention=True,
     ):
         if input_tokens is None:
-            input_tokens = self.build_input_tokens(det_feat, hist_feat, long_hist_feat)
+            input_tokens = self.build_input_tokens(
+                det_feat,
+                hist_feat,
+                long_hist_feat,
+                long_hist_len=long_hist_len,
+            )
         _, _, long_tokens = input_tokens
         batch_size = long_tokens.size(0)
         long_query = self.long_query_token.expand(batch_size, -1, -1)
         long_query = self.long_query_norm(long_query)
         long_kv = self.long_kv_norm(long_tokens)
+        long_padding_mask = self._build_key_padding_mask(
+            long_hist_len, long_kv.size(1), long_kv.device
+        )
 
         long_context, long_attn = self.long_attention(
             long_query,
             long_kv,
             long_kv,
+            key_padding_mask=long_padding_mask,
             need_weights=return_attention,
             average_attn_weights=False,
         )
@@ -272,8 +307,22 @@ class TemporalAttentionScorer(nn.Module):
         long_gate = torch.sigmoid(self.long_gate(gate_input))
         return long_gate, sim_short, sim_long
 
-    def forward(self, det_feat, hist_feat, long_hist_feat=None, return_attention=True):
-        input_tokens = self.build_input_tokens(det_feat, hist_feat, long_hist_feat)
+    def forward(
+        self,
+        det_feat,
+        hist_feat,
+        long_hist_feat=None,
+        short_hist_len=None,
+        long_hist_len=None,
+        return_attention=True,
+    ):
+        input_tokens = self.build_input_tokens(
+            det_feat,
+            hist_feat,
+            long_hist_feat,
+            short_hist_len=short_hist_len,
+            long_hist_len=long_hist_len,
+        )
         det_vec = self.det_norm(input_tokens[0])
 
         if return_attention:
@@ -281,6 +330,7 @@ class TemporalAttentionScorer(nn.Module):
                 det_feat,
                 hist_feat,
                 long_hist_feat=long_hist_feat,
+                short_hist_len=short_hist_len,
                 input_tokens=input_tokens,
                 return_attention=True,
             )
@@ -288,6 +338,7 @@ class TemporalAttentionScorer(nn.Module):
                 det_feat,
                 hist_feat,
                 long_hist_feat=long_hist_feat,
+                long_hist_len=long_hist_len,
                 input_tokens=input_tokens,
                 return_attention=True,
             )
@@ -296,6 +347,7 @@ class TemporalAttentionScorer(nn.Module):
                 det_feat,
                 hist_feat,
                 long_hist_feat=long_hist_feat,
+                short_hist_len=short_hist_len,
                 input_tokens=input_tokens,
                 return_attention=False,
             )
@@ -303,6 +355,7 @@ class TemporalAttentionScorer(nn.Module):
                 det_feat,
                 hist_feat,
                 long_hist_feat=long_hist_feat,
+                long_hist_len=long_hist_len,
                 input_tokens=input_tokens,
                 return_attention=False,
             )

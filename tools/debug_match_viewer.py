@@ -237,47 +237,74 @@ def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stri
     det_batch = []
     hist_batch = []
     long_hist_batch = []
+    short_len_batch = []
+    long_len_batch = []
     pair_indices = []
 
-    def _build_long_history(track):
-        long_history_len = getattr(model, "long_history_len", 3)
-        long_memory = getattr(track, "long_memory", [])
-        if len(long_memory) >= long_history_len:
-            sample_idx = np.linspace(
-                0, len(long_memory) - 1, num=long_history_len, dtype=int
-            )
-            return np.stack(
-                [np.asarray(long_memory[idx], dtype=np.float32) for idx in sample_idx],
-                axis=0,
-            )
+    def _build_short_history(track):
+        history_len = getattr(model, "history_len", 5)
+        short_memory = getattr(track, "short_memory", [])
+        if len(short_memory) > 0:
+            valid_len = min(len(short_memory), history_len)
+            recent = [
+                np.asarray(feat, dtype=np.float32)
+                for feat in short_memory[-history_len:]
+            ][::-1]
+            while len(recent) < history_len:
+                recent.append(recent[-1])
+            return np.stack(recent, axis=0), valid_len
+
         history = getattr(track, "det_feat_history", [])
-        if len(history) >= long_history_len:
-            sample_idx = np.linspace(
-                0, len(history) - 1, num=long_history_len, dtype=int
-            )
-            return np.stack(
-                [np.asarray(history[idx], dtype=np.float32) for idx in sample_idx],
-                axis=0,
-            )
+        if len(history) >= history_len:
+            valid_len = min(len(history), history_len)
+            recent = [
+                np.asarray(feat, dtype=np.float32)
+                for feat in history[-history_len:]
+            ][::-1]
+            return np.stack(recent, axis=0), valid_len
+        return None
+
+    def _build_long_history(track):
+        long_history_len = getattr(model, "long_history_len", 30)
+        long_memory = getattr(track, "long_memory", [])
+        if len(long_memory) > 0:
+            valid_len = min(len(long_memory), long_history_len)
+            long_items = [np.asarray(feat, dtype=np.float32) for feat in long_memory[-long_history_len:]]
+            while len(long_items) < long_history_len:
+                long_items.append(long_items[-1])
+            return np.stack(long_items, axis=0), valid_len
+        history = getattr(track, "det_feat_history", [])
+        if len(history) > 0:
+            valid_len = min(len(history), long_history_len)
+            long_items = [np.asarray(feat, dtype=np.float32) for feat in history[-long_history_len:]]
+            while len(long_items) < long_history_len:
+                long_items.append(long_items[-1])
+            return np.stack(long_items, axis=0), valid_len
         return None
 
     for i, track in enumerate(candidate_tracks):
         if len(getattr(track, "det_feat_history", [])) < 2 * stride + 1:
             continue
-        df_t = np.asarray(track.det_feat_history[-1], dtype=np.float32)
-        df_t_i = np.asarray(track.det_feat_history[-1 - stride], dtype=np.float32)
-        df_t_2i = np.asarray(track.det_feat_history[-1 - 2 * stride], dtype=np.float32)
-        long_hist = _build_long_history(track)
-        if long_hist is None:
-            long_hist = np.stack([df_t_2i, df_t_i, df_t], axis=0)
+        short_result = _build_short_history(track)
+        if short_result is None:
+            continue
+        short_hist, short_hist_len = short_result
+        long_result = _build_long_history(track)
+        if long_result is None:
+            long_hist = np.repeat(short_hist[-1:, :], getattr(model, "long_history_len", 30), axis=0)
+            long_hist_len = 1
+        else:
+            long_hist, long_hist_len = long_result
         for j, det in enumerate(detections):
             det_feat = np.asarray(det.feature, dtype=np.float32)
             det_norm = np.linalg.norm(det_feat)
             if det_norm > 1e-12:
                 det_feat = det_feat / det_norm
             det_batch.append(det_feat)
-            hist_batch.append(np.stack([df_t, df_t_i, df_t_2i], axis=0))
+            hist_batch.append(short_hist)
             long_hist_batch.append(long_hist)
+            short_len_batch.append(short_hist_len)
+            long_len_batch.append(long_hist_len)
             pair_indices.append((i, j))
 
     if not pair_indices:
@@ -286,22 +313,26 @@ def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stri
     det_tensor = torch.from_numpy(np.stack(det_batch, axis=0))
     hist_tensor = torch.from_numpy(np.stack(hist_batch, axis=0))
     long_hist_tensor = torch.from_numpy(np.stack(long_hist_batch, axis=0))
+    short_len_tensor = torch.from_numpy(np.asarray(short_len_batch, dtype=np.int64))
+    long_len_tensor = torch.from_numpy(np.asarray(long_len_batch, dtype=np.int64))
 
     with torch.no_grad():
         score_tensor, attn_tensor = model(
             det_tensor,
             hist_tensor,
             long_hist_feat=long_hist_tensor,
+            short_hist_len=short_len_tensor,
+            long_hist_len=long_len_tensor,
             return_attention=True,
         )
 
     scores = score_tensor.detach().cpu().numpy()
-    attn = attn_tensor.detach().cpu().numpy().mean(axis=1).squeeze(1)  # (B, 3)
+    attn = attn_tensor.detach().cpu().numpy().mean(axis=1).squeeze(1)
 
     for idx, (i, j) in enumerate(pair_indices):
         score_matrix[i, j] = float(scores[idx])
-        attn_delta1_matrix[i, j] = float(attn[idx, 1])
-        attn_delta2_matrix[i, j] = float(attn[idx, 2])
+        attn_delta1_matrix[i, j] = float(attn[idx, 1]) if attn.shape[1] > 1 else 0.0
+        attn_delta2_matrix[i, j] = float(attn[idx, 2]) if attn.shape[1] > 2 else 0.0
 
     return score_matrix, attn_delta1_matrix, attn_delta2_matrix
 

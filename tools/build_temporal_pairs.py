@@ -3,9 +3,8 @@
 
 Each sample contains:
   - det_feat
-  - df_t
-  - df_t_i
-  - df_t_2i
+  - short_hist_feat   (recent short-memory tokens)
+  - long_hist_feat    (full long-memory bank tokens)
   - label
 
 Pseudo labels are derived from a tracking result txt by matching detections
@@ -54,6 +53,8 @@ def parse_args():
 
     parser.add_argument("--temporal_stride", type=int, default=2)
     parser.add_argument("--iou_threshold", type=float, default=0.5)
+    parser.add_argument("--short_history_len", type=int, default=5)
+    parser.add_argument("--long_history_len", type=int, default=30)
     return parser.parse_args()
 
 
@@ -154,15 +155,44 @@ def main():
     tracker = Tracker(metric)
 
     det_feat_list = []
-    df_t_list = []
-    df_t_i_list = []
-    df_t_2i_list = []
+    short_hist_feat_list = []
+    long_hist_feat_list = []
+    short_hist_len_list = []
+    long_hist_len_list = []
     label_list = []
     frame_list = []
     track_id_list = []
     det_index_list = []
 
     stride = max(1, int(args.temporal_stride))
+    short_history_len = max(2, int(args.short_history_len))
+    long_history_len = max(1, int(args.long_history_len))
+
+    def build_short_history(track):
+        short_memory = getattr(track, "short_memory", [])
+        if len(short_memory) == 0:
+            return None
+        valid_len = min(len(short_memory), short_history_len)
+        short_items = [
+            np.asarray(feat, dtype=np.float32)
+            for feat in short_memory[-short_history_len:]
+        ][::-1]
+        while len(short_items) < short_history_len:
+            short_items.append(short_items[-1])
+        return np.stack(short_items, axis=0), valid_len
+
+    def build_long_history(track):
+        long_memory = getattr(track, "long_memory", [])
+        if len(long_memory) == 0:
+            return None
+        valid_len = min(len(long_memory), long_history_len)
+        long_items = [
+            np.asarray(feat, dtype=np.float32)
+            for feat in long_memory[-long_history_len:]
+        ]
+        while len(long_items) < long_history_len:
+            long_items.append(long_items[-1])
+        return np.stack(long_items, axis=0), valid_len
 
     min_frame = seq_info["min_frame_idx"]
     max_frame = seq_info["max_frame_idx"]
@@ -214,10 +244,12 @@ def main():
             history = getattr(track, "det_feat_history", [])
             if len(history) < 2 * stride + 1:
                 continue
-
-            df_t = np.asarray(history[-1], dtype=np.float32)
-            df_t_i = np.asarray(history[-1 - stride], dtype=np.float32)
-            df_t_2i = np.asarray(history[-1 - 2 * stride], dtype=np.float32)
+            short_result = build_short_history(track)
+            long_result = build_long_history(track)
+            if short_result is None or long_result is None:
+                continue
+            short_hist, short_hist_len = short_result
+            long_hist, long_hist_len = long_result
 
             positive_det_indices = [
                 det_idx for det_idx, target_id in enumerate(det_target_ids)
@@ -239,9 +271,10 @@ def main():
                     det_feat = det_feat / det_norm
 
                 det_feat_list.append(det_feat)
-                df_t_list.append(df_t)
-                df_t_i_list.append(df_t_i)
-                df_t_2i_list.append(df_t_2i)
+                short_hist_feat_list.append(short_hist)
+                long_hist_feat_list.append(long_hist)
+                short_hist_len_list.append(short_hist_len)
+                long_hist_len_list.append(long_hist_len)
                 label_list.append(1.0 if det_target_ids[det_idx] == track.track_id else 0.0)
                 frame_list.append(frame_idx)
                 track_id_list.append(track.track_id)
@@ -272,9 +305,10 @@ def main():
     np.savez_compressed(
         output_path,
         det_feat=np.asarray(det_feat_list, dtype=np.float32),
-        df_t=np.asarray(df_t_list, dtype=np.float32),
-        df_t_i=np.asarray(df_t_i_list, dtype=np.float32),
-        df_t_2i=np.asarray(df_t_2i_list, dtype=np.float32),
+        short_hist_feat=np.asarray(short_hist_feat_list, dtype=np.float32),
+        long_hist_feat=np.asarray(long_hist_feat_list, dtype=np.float32),
+        short_hist_len=np.asarray(short_hist_len_list, dtype=np.int32),
+        long_hist_len=np.asarray(long_hist_len_list, dtype=np.int32),
         label=np.asarray(label_list, dtype=np.float32),
         frame=np.asarray(frame_list, dtype=np.int32),
         track_id=np.asarray(track_id_list, dtype=np.int32),
