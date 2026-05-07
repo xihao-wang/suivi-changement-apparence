@@ -2,17 +2,17 @@
 from __future__ import division, print_function, absolute_import
 
 import argparse
+import json
 import os
+import sys
 
 import cv2
 import numpy as np
+import torch
 
 from application_util import preprocessing
 from application_util import visualization
-from deep_sort import nn_matching
 from deep_sort.detection import Detection
-from deep_sort.tracker import Tracker
-from opts import opt
 
 
 def gather_sequence_info(sequence_dir, detection_file):
@@ -127,9 +127,123 @@ def create_detections(detection_mat, frame_idx, min_height=0):
     return detection_list
 
 
+def _build_short_history(track, history_len):
+    short_memory = getattr(track, "short_memory", [])
+    if len(short_memory) > 0:
+        valid_len = min(len(short_memory), history_len)
+        items = [np.asarray(feat, dtype=np.float32) for feat in short_memory[-history_len:]][::-1]
+        while len(items) < history_len:
+            items.append(items[-1])
+        return np.stack(items, axis=0), valid_len
+
+    history = getattr(track, "det_feat_history", [])
+    if len(history) > 0:
+        valid_len = min(len(history), history_len)
+        items = [np.asarray(feat, dtype=np.float32) for feat in history[-history_len:]][::-1]
+        while len(items) < history_len:
+            items.append(items[-1])
+        return np.stack(items, axis=0), valid_len
+    return None
+
+
+def _build_long_history(track, long_history_len):
+    long_memory = getattr(track, "long_memory", [])
+    if len(long_memory) > 0:
+        valid_len = min(len(long_memory), long_history_len)
+        items = [np.asarray(feat, dtype=np.float32) for feat in long_memory[-long_history_len:]]
+        while len(items) < long_history_len:
+            items.append(items[-1])
+        return np.stack(items, axis=0), valid_len
+
+    history = getattr(track, "det_feat_history", [])
+    if len(history) > 0:
+        valid_len = min(len(history), long_history_len)
+        items = [np.asarray(feat, dtype=np.float32) for feat in history[-long_history_len:]]
+        while len(items) < long_history_len:
+            items.append(items[-1])
+        return np.stack(items, axis=0), valid_len
+    return None
+
+
+def _load_temporal_model(temporal_model_ckpt, feature_dim):
+    from deep_sort.temporal_model import TemporalAttentionScorer
+
+    if temporal_model_ckpt is None:
+        raise ValueError("--temporal_model_ckpt is required with --learned_temporal")
+    ckpt = torch.load(temporal_model_ckpt, map_location="cpu")
+    state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+    hidden_dim = int(ckpt.get("hidden_dim", 256)) if isinstance(ckpt, dict) else 256
+    num_heads = int(ckpt.get("num_heads", 4)) if isinstance(ckpt, dict) else 4
+    history_len = int(ckpt.get("history_len", 5)) if isinstance(ckpt, dict) else 5
+    long_history_len = int(ckpt.get("long_history_len", 30)) if isinstance(ckpt, dict) else 30
+    use_long_memory = bool(ckpt.get("use_long_memory", True)) if isinstance(ckpt, dict) else True
+    model = TemporalAttentionScorer(
+        feature_dim=feature_dim,
+        hidden_dim=hidden_dim,
+        num_heads=num_heads,
+        history_len=history_len,
+        long_history_len=long_history_len,
+        use_long_memory=use_long_memory,
+    )
+    model.load_state_dict(state_dict, strict=False)
+    model.eval()
+    return model
+
+
+def _compute_temporal_scores(candidate_tracks, detections, model):
+    score_matrix = np.zeros((len(candidate_tracks), len(detections)), dtype=np.float32)
+    det_batch, short_batch, long_batch = [], [], []
+    short_len_batch, long_len_batch, pair_indices = [], [], []
+    history_len = getattr(model, "history_len", 5)
+    long_history_len = getattr(model, "long_history_len", 30)
+
+    for track_idx, track in enumerate(candidate_tracks):
+        short_result = _build_short_history(track, history_len)
+        if short_result is None:
+            continue
+        short_hist, short_len = short_result
+        long_result = _build_long_history(track, long_history_len)
+        if long_result is None:
+            long_hist = np.repeat(short_hist[-1:, :], long_history_len, axis=0)
+            long_len = 1
+        else:
+            long_hist, long_len = long_result
+        for det_idx, det in enumerate(detections):
+            det_feat = np.asarray(det.feature, dtype=np.float32)
+            norm = np.linalg.norm(det_feat)
+            if norm > 1e-12:
+                det_feat = det_feat / norm
+            det_batch.append(det_feat)
+            short_batch.append(short_hist)
+            long_batch.append(long_hist)
+            short_len_batch.append(short_len)
+            long_len_batch.append(long_len)
+            pair_indices.append((track_idx, det_idx))
+
+    if not pair_indices:
+        return score_matrix
+
+    with torch.no_grad():
+        scores = model(
+            torch.from_numpy(np.stack(det_batch, axis=0)),
+            torch.from_numpy(np.stack(short_batch, axis=0)),
+            long_hist_feat=torch.from_numpy(np.stack(long_batch, axis=0)),
+            short_hist_len=torch.from_numpy(np.asarray(short_len_batch, dtype=np.int64)),
+            long_hist_len=torch.from_numpy(np.asarray(long_len_batch, dtype=np.int64)),
+            return_attention=False,
+        ).detach().cpu().numpy()
+
+    for idx, (track_idx, det_idx) in enumerate(pair_indices):
+        score_matrix[track_idx, det_idx] = float(scores[idx])
+    return score_matrix
+
+
 def run(sequence_dir, detection_file, output_file, min_confidence,
         nms_max_overlap, min_detection_height, max_cosine_distance,
-        nn_budget, display):
+        nn_budget, display, learned_temporal=False, temporal_model_ckpt=None,
+        temporal_scores_file=None, learned_temporal_alpha=1.0,
+        fuse_learned_temporal=False, learned_temporal_max_correction=0.02,
+        learned_temporal_min_scale=0.02):
     """Run multi-target tracker on a particular sequence.
 
     Parameters
@@ -158,13 +272,30 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
         If True, show visualization of intermediate tracking results.
 
     """
+    from deep_sort import nn_matching
+    from deep_sort.tracker import Tracker
+    from opts import opt
+
     seq_info = gather_sequence_info(sequence_dir, detection_file)
     metric = nn_matching.NearestNeighborDistanceMetric(
         'cosine',
         max_cosine_distance,
         nn_budget
     )
-    tracker = Tracker(metric)
+    temporal_model = None
+    temporal_score_rows = []
+    if learned_temporal:
+        temporal_model = _load_temporal_model(
+            temporal_model_ckpt, seq_info["feature_dim"]
+        )
+    tracker = Tracker(
+        metric,
+        temporal_model=temporal_model if learned_temporal else None,
+        temporal_alpha=learned_temporal_alpha,
+        fuse_temporal_model=fuse_learned_temporal,
+        temporal_max_correction=learned_temporal_max_correction,
+        temporal_min_scale=learned_temporal_min_scale,
+    )
     results = []
 
     def frame_callback(vis, frame_idx):
@@ -187,6 +318,15 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
             tracker.camera_update(sequence_dir.split('/')[-1], frame_idx)
 
         tracker.predict()
+        if temporal_model is not None:
+            candidate_tracks = [track for track in tracker.tracks if track.is_confirmed()]
+            score_matrix = _compute_temporal_scores(candidate_tracks, detections, temporal_model)
+            temporal_score_rows.append({
+                "frame": int(frame_idx),
+                "track_ids": [int(track.track_id) for track in candidate_tracks],
+                "detection_indices": list(range(len(detections))),
+                "scores": score_matrix.tolist(),
+            })
         tracker.update(detections)
 
         # Update visualization.
@@ -202,8 +342,12 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
             if not track.is_confirmed() or track.time_since_update > 1:
                 continue
             bbox = track.to_tlwh()
+            match_confidence = getattr(track, "match_confidence", None)
+            if match_confidence is None:
+                match_confidence = 0.0
             results.append([
-                    frame_idx, track.track_id, bbox[0], bbox[1], bbox[2], bbox[3]])
+                    frame_idx, track.track_id, bbox[0], bbox[1], bbox[2], bbox[3],
+                    float(match_confidence)])
 
     # Run tracker.
     if display:
@@ -218,8 +362,17 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
         os.makedirs(output_dir, exist_ok=True)
     f = open(output_file, 'w')
     for row in results:
-        print('%d,%d,%.2f,%.2f,%.2f,%.2f,1,-1,-1,-1' % (
-            row[0], row[1], row[2], row[3], row[4], row[5]),file=f)
+        print('%d,%d,%.2f,%.2f,%.2f,%.2f,%.4f,-1,-1,-1' % (
+            row[0], row[1], row[2], row[3], row[4], row[5], row[6]),file=f)
+    f.close()
+
+    if temporal_scores_file:
+        score_dir = os.path.dirname(temporal_scores_file)
+        if score_dir:
+            os.makedirs(score_dir, exist_ok=True)
+        with open(temporal_scores_file, "w") as score_f:
+            for row in temporal_score_rows:
+                score_f.write(json.dumps(row) + "\n")
 
 def bool_string(input_string):
     if input_string not in {"True","False"}:
@@ -261,12 +414,56 @@ def parse_args():
     parser.add_argument(
         "--display", help="Show intermediate tracking results",
         default=True, type=bool_string)
+    parser.add_argument("--BoT", action="store_true")
+    parser.add_argument("--ECC", action="store_true")
+    parser.add_argument("--NSA", action="store_true")
+    parser.add_argument("--EMA", action="store_true")
+    parser.add_argument("--MC", action="store_true")
+    parser.add_argument("--woC", action="store_true")
+    parser.add_argument("--ltm_stm", action="store_true")
+    parser.add_argument("--memory_init", action="store_true")
+    parser.add_argument("--memory_aware", action="store_true")
+    parser.add_argument("--topk", action="store_true")
+    parser.add_argument("--full", action="store_true")
+    parser.add_argument("--phase_truncation", action="store_true")
+    parser.add_argument("--learned_temporal", action="store_true")
+    parser.add_argument("--fuse_learned_temporal", action="store_true")
+    parser.add_argument("--temporal_model_ckpt", default=None)
+    parser.add_argument("--temporal_scores_file", default=None)
+    parser.add_argument("--learned_temporal_alpha", type=float, default=1.0)
+    parser.add_argument("--learned_temporal_max_correction", type=float, default=0.02)
+    parser.add_argument("--learned_temporal_min_scale", type=float, default=0.02)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    opt_argv = [sys.argv[0], "CustomDemo", "test"]
+    for flag in [
+        "BoT",
+        "ECC",
+        "NSA",
+        "EMA",
+        "MC",
+        "woC",
+        "ltm_stm",
+        "memory_init",
+        "memory_aware",
+        "topk",
+        "full",
+        "phase_truncation",
+    ]:
+        if getattr(args, flag):
+            opt_argv.append(f"--{flag}")
+    sys.argv = opt_argv
     run(
         args.sequence_dir, args.detection_file, args.output_file,
         args.min_confidence, args.nms_max_overlap, args.min_detection_height,
-        args.max_cosine_distance, args.nn_budget, args.display)
+        args.max_cosine_distance, args.nn_budget, args.display,
+        learned_temporal=args.learned_temporal,
+        temporal_model_ckpt=args.temporal_model_ckpt,
+        temporal_scores_file=args.temporal_scores_file,
+        learned_temporal_alpha=args.learned_temporal_alpha,
+        fuse_learned_temporal=args.fuse_learned_temporal,
+        learned_temporal_max_correction=args.learned_temporal_max_correction,
+        learned_temporal_min_scale=args.learned_temporal_min_scale)

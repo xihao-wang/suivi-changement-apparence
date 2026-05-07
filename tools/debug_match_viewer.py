@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import colorsys
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,8 +38,15 @@ class FrameReport:
     tracks: list[dict[str, Any]]
     appearance_cost_matrix: list[list[float]]
     learned_temporal_score_matrix: list[list[float]]
-    learned_attn_delta1_matrix: list[list[float]]
-    learned_attn_delta2_matrix: list[list[float]]
+    learned_short_attn_matrices: list[list[list[float]]]
+    learned_short_attn_top_matrix: list[list[float]]
+    learned_short_attn_entropy_matrix: list[list[float]]
+    learned_short_similarity_matrix: list[list[float]]
+    learned_long_gate_matrix: list[list[float]]
+    learned_long_similarity_matrix: list[list[float]]
+    learned_long_attn_recent_matrix: list[list[float]]
+    learned_long_attn_top_matrix: list[list[float]]
+    learned_long_attn_entropy_matrix: list[list[float]]
     final_cost_matrix: list[list[float]]
     raw_cost_matrix: list[list[float]]
     gated_cost_matrix: list[list[float]]
@@ -47,6 +55,21 @@ class FrameReport:
     unmatched_detection_indices: list[int]
     ambiguous_track_ids: list[int]
     ambiguous_info: dict[int, dict[str, Any]]
+
+
+def _load_temporal_scores_jsonl(path: str | None) -> dict[int, dict[str, Any]]:
+    if not path:
+        return {}
+    score_by_frame: dict[int, dict[str, Any]] = {}
+    with open(path, "r") as f:
+        for line in f:
+            row = line.strip()
+            if not row:
+                continue
+            obj = json.loads(row)
+            frame = int(obj["frame"])
+            score_by_frame[frame] = obj
+    return score_by_frame
 
 
 def _format_bbox(tlwh) -> str:
@@ -66,6 +89,11 @@ def build_reports(
     temporal_hidden_dim: int = 256,
     temporal_num_heads: int = 4,
     temporal_stride: int = 2,
+    temporal_alpha: float = 1.0,
+    fuse_learned_temporal: bool = False,
+    temporal_max_correction: float = 0.02,
+    temporal_min_scale: float = 0.02,
+    temporal_scores_file: str | None = None,
 ) -> tuple[list[FrameReport], int, int]:
     from application_util import preprocessing
     from deep_sort import linear_assignment, nn_matching
@@ -75,18 +103,24 @@ def build_reports(
     from opts import opt
 
     seq_info = gather_sequence_info(sequence_dir, detection_file)
+    precomputed_scores_by_frame = _load_temporal_scores_jsonl(temporal_scores_file)
     metric = nn_matching.NearestNeighborDistanceMetric(
         "cosine", max_cosine_distance, nn_budget
     )
-    tracker = Tracker(metric)
     learned_temporal_model = None
-    if enable_learned_temporal:
+    if enable_learned_temporal and not precomputed_scores_by_frame:
+        if temporal_model_ckpt is None:
+            raise ValueError(
+                "--temporal_model_ckpt or --temporal_scores_file is required with --learned_temporal"
+            )
         feature_dim = seq_info["detections"].shape[1] - 10
         ckpt_long_history_len = 3
+        ckpt_use_long_memory = True
         if temporal_model_ckpt:
             ckpt = torch.load(temporal_model_ckpt, map_location="cpu")
             if isinstance(ckpt, dict):
                 ckpt_long_history_len = int(ckpt.get("long_history_len", 3))
+                ckpt_use_long_memory = bool(ckpt.get("use_long_memory", True))
             else:
                 ckpt = {"state_dict": ckpt}
         learned_temporal_model = TemporalAttentionScorer(
@@ -94,11 +128,20 @@ def build_reports(
             hidden_dim=temporal_hidden_dim,
             num_heads=temporal_num_heads,
             long_history_len=ckpt_long_history_len,
+            use_long_memory=ckpt_use_long_memory,
         )
         if temporal_model_ckpt:
             state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
             learned_temporal_model.load_state_dict(state_dict, strict=False)
         learned_temporal_model.eval()
+    tracker = Tracker(
+        metric,
+        temporal_model=learned_temporal_model if enable_learned_temporal else None,
+        temporal_alpha=temporal_alpha,
+        fuse_temporal_model=fuse_learned_temporal,
+        temporal_max_correction=temporal_max_correction,
+        temporal_min_scale=temporal_min_scale,
+    )
 
     reports: list[FrameReport] = []
     min_frame = seq_info["min_frame_idx"]
@@ -130,6 +173,49 @@ def build_reports(
         if len(candidate_tracks) > 0 and len(detections) > 0:
             appearance_cost, final_cost = \
                 tracker.metric.distance_components_with_memory(features, candidate_tracks)
+            if enable_learned_temporal:
+                precomputed = precomputed_scores_by_frame.get(frame_idx)
+                precomputed_ok = False
+                if precomputed is not None:
+                    expected_track_ids = [int(track.track_id) for track in candidate_tracks]
+                    expected_detection_indices = list(range(len(detections)))
+                    file_track_ids = [int(x) for x in precomputed.get("track_ids", [])]
+                    file_detection_indices = [int(x) for x in precomputed.get("detection_indices", [])]
+                    if (
+                        file_track_ids == expected_track_ids
+                        and file_detection_indices == expected_detection_indices
+                    ):
+                        learned_score_candidate = np.asarray(
+                            precomputed.get("scores", []), dtype=np.float32
+                        )
+                        if learned_score_candidate.shape == (len(candidate_tracks), len(detections)):
+                            learned_score = learned_score_candidate
+                            learned_short_attn = []
+                            learned_diag = _empty_learned_diagnostics(len(candidate_tracks), len(detections))
+                            precomputed_ok = True
+                if not precomputed_ok:
+                    if learned_temporal_model is None:
+                        raise ValueError(
+                            f"Precomputed temporal scores do not match viewer state at frame {frame_idx}. "
+                            "Provide the matching --temporal_model_ckpt to allow fallback recomputation, "
+                            "or regenerate the jsonl with the same tracker settings."
+                        )
+                    else:
+                        learned_score, learned_short_attn, learned_diag = \
+                            _compute_learned_temporal_matrices(
+                                candidate_tracks,
+                                detections,
+                                learned_temporal_model,
+                                stride=max(1, int(temporal_stride)),
+                            )
+            else:
+                learned_score = np.zeros((len(candidate_tracks), len(detections)))
+                learned_short_attn = []
+                learned_diag = _empty_learned_diagnostics(len(candidate_tracks), len(detections))
+            if enable_learned_temporal and fuse_learned_temporal:
+                learned_prob = 1.0 / (1.0 + np.exp(-learned_score))
+                temporal_cost = 1.0 - learned_prob
+                final_cost = tracker._fuse_temporal_cost(final_cost, temporal_cost)
             raw_cost = final_cost
             gated_cost = linear_assignment.gate_cost_matrix(
                 raw_cost.copy(),
@@ -138,23 +224,11 @@ def build_reports(
                 confirmed_track_indices,
                 detection_indices,
             )
-            if enable_learned_temporal:
-                learned_score, learned_attn_delta1, learned_attn_delta2 = \
-                    _compute_learned_temporal_matrices(
-                        candidate_tracks,
-                        detections,
-                        learned_temporal_model,
-                        stride=max(1, int(temporal_stride)),
-                    )
-            else:
-                learned_score = np.zeros((len(candidate_tracks), len(detections)))
-                learned_attn_delta1 = np.zeros((len(candidate_tracks), len(detections)))
-                learned_attn_delta2 = np.zeros((len(candidate_tracks), len(detections)))
         else:
             appearance_cost = np.zeros((len(candidate_tracks), len(detections)))
             learned_score = np.zeros((len(candidate_tracks), len(detections)))
-            learned_attn_delta1 = np.zeros((len(candidate_tracks), len(detections)))
-            learned_attn_delta2 = np.zeros((len(candidate_tracks), len(detections)))
+            learned_short_attn = []
+            learned_diag = _empty_learned_diagnostics(len(candidate_tracks), len(detections))
             final_cost = np.zeros((len(candidate_tracks), len(detections)))
             raw_cost = np.zeros((len(candidate_tracks), len(detections)))
             gated_cost = raw_cost.copy()
@@ -178,14 +252,25 @@ def build_reports(
                     "hits": track.hits,
                     "age": track.age,
                     "time_since_update": track.time_since_update,
+                    "match_confidence": (
+                        None if getattr(track, "match_confidence", None) is None
+                        else float(track.match_confidence)
+                    ),
                     "bbox_tlwh": [float(x) for x in track.to_tlwh()],
                 }
                 for track in candidate_tracks
             ],
             appearance_cost_matrix=appearance_cost.tolist(),
             learned_temporal_score_matrix=learned_score.tolist(),
-            learned_attn_delta1_matrix=learned_attn_delta1.tolist(),
-            learned_attn_delta2_matrix=learned_attn_delta2.tolist(),
+            learned_short_attn_matrices=[matrix.tolist() for matrix in learned_short_attn],
+            learned_short_attn_top_matrix=learned_diag["short_attn_top"].tolist(),
+            learned_short_attn_entropy_matrix=learned_diag["short_attn_entropy"].tolist(),
+            learned_short_similarity_matrix=learned_diag["short_similarity"].tolist(),
+            learned_long_gate_matrix=learned_diag["long_gate"].tolist(),
+            learned_long_similarity_matrix=learned_diag["long_similarity"].tolist(),
+            learned_long_attn_recent_matrix=learned_diag["long_attn_recent"].tolist(),
+            learned_long_attn_top_matrix=learned_diag["long_attn_top"].tolist(),
+            learned_long_attn_entropy_matrix=learned_diag["long_attn_entropy"].tolist(),
             final_cost_matrix=final_cost.tolist(),
             raw_cost_matrix=raw_cost.tolist(),
             gated_cost_matrix=gated_cost.tolist(),
@@ -227,12 +312,39 @@ def build_reports(
     return reports, min_frame, max_frame
 
 
+def _empty_learned_diagnostics(num_tracks, num_dets):
+    return {
+        "short_attn_top": np.zeros((num_tracks, num_dets), dtype=np.float32),
+        "short_attn_entropy": np.zeros((num_tracks, num_dets), dtype=np.float32),
+        "short_similarity": np.zeros((num_tracks, num_dets), dtype=np.float32),
+        "long_gate": np.zeros((num_tracks, num_dets), dtype=np.float32),
+        "long_similarity": np.zeros((num_tracks, num_dets), dtype=np.float32),
+        "long_attn_recent": np.zeros((num_tracks, num_dets), dtype=np.float32),
+        "long_attn_top": np.zeros((num_tracks, num_dets), dtype=np.float32),
+        "long_attn_entropy": np.zeros((num_tracks, num_dets), dtype=np.float32),
+    }
+
+
+def _normalized_entropy(weights, valid_len):
+    valid_len = max(1, int(valid_len))
+    weights = np.asarray(weights[:valid_len], dtype=np.float64)
+    weights = weights / max(float(weights.sum()), 1e-12)
+    entropy = -float(np.sum(weights * np.log(np.maximum(weights, 1e-12))))
+    if valid_len <= 1:
+        return 0.0
+    return entropy / np.log(valid_len)
+
+
 def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stride):
     num_tracks = len(candidate_tracks)
     num_dets = len(detections)
     score_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
-    attn_delta1_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
-    attn_delta2_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
+    diag = _empty_learned_diagnostics(num_tracks, num_dets)
+    history_len = getattr(model, "history_len", 5)
+    short_attn_matrices = [
+        np.zeros((num_tracks, num_dets), dtype=np.float32)
+        for _ in range(history_len)
+    ]
 
     det_batch = []
     hist_batch = []
@@ -242,7 +354,6 @@ def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stri
     pair_indices = []
 
     def _build_short_history(track):
-        history_len = getattr(model, "history_len", 5)
         short_memory = getattr(track, "short_memory", [])
         if len(short_memory) > 0:
             valid_len = min(len(short_memory), history_len)
@@ -283,8 +394,6 @@ def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stri
         return None
 
     for i, track in enumerate(candidate_tracks):
-        if len(getattr(track, "det_feat_history", [])) < 2 * stride + 1:
-            continue
         short_result = _build_short_history(track)
         if short_result is None:
             continue
@@ -308,7 +417,7 @@ def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stri
             pair_indices.append((i, j))
 
     if not pair_indices:
-        return score_matrix, attn_delta1_matrix, attn_delta2_matrix
+        return score_matrix, short_attn_matrices, diag
 
     det_tensor = torch.from_numpy(np.stack(det_batch, axis=0))
     hist_tensor = torch.from_numpy(np.stack(hist_batch, axis=0))
@@ -328,13 +437,38 @@ def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stri
 
     scores = score_tensor.detach().cpu().numpy()
     attn = attn_tensor.detach().cpu().numpy().mean(axis=1).squeeze(1)
+    short_similarity = model.last_short_similarity.detach().cpu().numpy().squeeze(1)
+    long_gate = model.last_long_gate.detach().cpu().numpy().squeeze(1)
+    long_similarity = model.last_long_similarity.detach().cpu().numpy().squeeze(1)
+    long_attn_tensor = model.last_long_attention
+    if long_attn_tensor is None:
+        long_attn = None
+    else:
+        long_attn = long_attn_tensor.detach().cpu().numpy().mean(axis=1).squeeze(1)
+    short_lens = np.asarray(short_len_batch, dtype=np.int64)
+    long_lens = np.asarray(long_len_batch, dtype=np.int64)
 
     for idx, (i, j) in enumerate(pair_indices):
         score_matrix[i, j] = float(scores[idx])
-        attn_delta1_matrix[i, j] = float(attn[idx, 1]) if attn.shape[1] > 1 else 0.0
-        attn_delta2_matrix[i, j] = float(attn[idx, 2]) if attn.shape[1] > 2 else 0.0
+        for token_idx in range(min(len(short_attn_matrices), attn.shape[1])):
+            short_attn_matrices[token_idx][i, j] = float(attn[idx, token_idx])
+        short_len = int(short_lens[idx])
+        short_weights = attn[idx, :short_len]
+        diag["short_attn_top"][i, j] = float(np.max(short_weights)) if short_weights.size else 0.0
+        diag["short_attn_entropy"][i, j] = _normalized_entropy(attn[idx], short_len)
+        diag["short_similarity"][i, j] = float(short_similarity[idx])
+        diag["long_gate"][i, j] = float(long_gate[idx])
+        diag["long_similarity"][i, j] = float(long_similarity[idx])
+        if long_attn is not None:
+            long_len = int(long_lens[idx])
+            long_weights = long_attn[idx, :long_len]
+            recent_count = min(5, long_len)
+            recent_weights = long_attn[idx, long_len - recent_count: long_len]
+            diag["long_attn_recent"][i, j] = float(np.sum(recent_weights)) if recent_weights.size else 0.0
+            diag["long_attn_top"][i, j] = float(np.max(long_weights)) if long_weights.size else 0.0
+            diag["long_attn_entropy"][i, j] = _normalized_entropy(long_attn[idx], long_len)
 
-    return score_matrix, attn_delta1_matrix, attn_delta2_matrix
+    return score_matrix, short_attn_matrices, diag
 
 
 class MatchViewerApp:
@@ -472,7 +606,11 @@ class MatchViewerApp:
             x, y, w, h = [int(v) for v in tr["bbox_tlwh"]]
             color = create_unique_color_uchar(tr["track_id"])
             cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
-            label = f"T{tr['track_id']}"
+            match_conf = tr.get("match_confidence")
+            if match_conf is None:
+                label = f"T{tr['track_id']}"
+            else:
+                label = f"T{tr['track_id']} {match_conf:.2f}"
             (text_w, text_h), baseline = cv2.getTextSize(
                 label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
             )
@@ -526,10 +664,12 @@ class MatchViewerApp:
 
         self.summary_text.insert(tk.END, "\nTracks\n")
         for tr in report.tracks:
+            match_conf = tr.get("match_confidence")
+            match_conf_text = "none" if match_conf is None else f"{match_conf:.3f}"
             self.summary_text.insert(
                 tk.END,
                 f"  T{tr['track_id']}: hits={tr['hits']}, age={tr['age']}, time_since_update={tr['time_since_update']}, "
-                f"bbox={_format_bbox(tr['bbox_tlwh'])}\n",
+                f"match_conf={match_conf_text}, bbox={_format_bbox(tr['bbox_tlwh'])}\n",
             )
 
         self.summary_text.insert(tk.END, "\nMatches\n")
@@ -576,10 +716,32 @@ class MatchViewerApp:
                 report,
             ),
         )
-        self.matrix_text.insert(tk.END, "\nLearned attention from det_feat to df_t-i\n")
-        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_delta1_matrix, report))
-        self.matrix_text.insert(tk.END, "\nLearned attention from det_feat to df_t-2i\n")
-        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_attn_delta2_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned short summary: top attention\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_short_attn_top_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned short summary: attention entropy\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_short_attn_entropy_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned short summary: det/short similarity\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_short_similarity_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned long summary: gate weight\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_long_gate_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned long summary: det/long similarity\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_long_similarity_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned long summary: attention mass on recent 5 valid tokens\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_long_attn_recent_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned long summary: top attention\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_long_attn_top_matrix, report))
+        self.matrix_text.insert(tk.END, "\nLearned long summary: attention entropy\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.learned_long_attn_entropy_matrix, report))
+        for token_idx, matrix in enumerate(report.learned_short_attn_matrices):
+            if token_idx == 0:
+                label = "short_memory[0] latest"
+            else:
+                label = f"short_memory[{token_idx}] older"
+            self.matrix_text.insert(
+                tk.END,
+                f"\nLearned attention from det_feat to {label}\n",
+            )
+            self.matrix_text.insert(tk.END, self.format_matrix(matrix, report))
         self.matrix_text.insert(tk.END, "\nFinal cost matrix(before gating)\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.final_cost_matrix, report))
         self.matrix_text.insert(tk.END, "\nGated distance matrix(motion / Kalman gating)\n")
@@ -627,10 +789,15 @@ def parse_args():
     parser.add_argument("--topk", action="store_true", help="Enable top-k matching")
     parser.add_argument("--full", action="store_true", help="Enable full modified pipeline")
     parser.add_argument("--learned_temporal", action="store_true", help="Show learned temporal score matrix using TemporalAttentionScorer")
+    parser.add_argument("--fuse_learned_temporal", action="store_true", help="Use learned temporal score in the online tracker association.")
     parser.add_argument("--temporal_model_ckpt", type=str, default=None, help="Optional checkpoint path for the learned temporal scorer")
+    parser.add_argument("--temporal_scores_file", type=str, default=None, help="Optional precomputed jsonl from deep_sort_app. If provided, viewer reads learned scores from this file instead of recomputing them.")
     parser.add_argument("--temporal_hidden_dim", type=int, default=256, help="Hidden dimension for the learned temporal scorer")
     parser.add_argument("--temporal_num_heads", type=int, default=4, help="Number of attention heads for the learned temporal scorer")
-    parser.add_argument("--learned_temporal_stride", type=int, default=2, help="Temporal stride used to sample [df_t, df_t-i, df_t-2i] and derive delta_1 / delta_2 for the learned temporal scorer")
+    parser.add_argument("--learned_temporal_stride", type=int, default=2, help="Deprecated; kept for old commands. Current scorer uses short_memory tokens directly.")
+    parser.add_argument("--learned_temporal_alpha", type=float, default=1.0, help="Baseline-vs-learned cost fusion weight used by the online tracker.")
+    parser.add_argument("--learned_temporal_max_correction", type=float, default=0.02, help="Maximum absolute cost correction applied by learned temporal fusion.")
+    parser.add_argument("--learned_temporal_min_scale", type=float, default=0.02, help="Minimum baseline row scale used by adaptive temporal fusion.")
     parser.add_argument("--min_confidence", type=float, default=None)
     parser.add_argument("--min_detection_height", type=int, default=None)
     parser.add_argument("--nms_max_overlap", type=float, default=None)
@@ -690,6 +857,11 @@ def main():
         temporal_hidden_dim=args.temporal_hidden_dim,
         temporal_num_heads=args.temporal_num_heads,
         temporal_stride=args.learned_temporal_stride,
+        temporal_alpha=args.learned_temporal_alpha,
+        fuse_learned_temporal=args.fuse_learned_temporal,
+        temporal_max_correction=args.learned_temporal_max_correction,
+        temporal_min_scale=args.learned_temporal_min_scale,
+        temporal_scores_file=args.temporal_scores_file,
     )
     print(f"Loaded {len(reports)} frames.")
     root = tk.Tk()

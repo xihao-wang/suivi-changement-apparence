@@ -42,6 +42,7 @@ class TemporalAttentionScorer(nn.Module):
         dropout=0.0,
         history_len=5,
         long_history_len=30,
+        use_long_memory=True,
     ):
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -57,6 +58,7 @@ class TemporalAttentionScorer(nn.Module):
         self.dropout = dropout
         self.history_len = history_len
         self.long_history_len = long_history_len
+        self.use_long_memory = use_long_memory
 
         self.input_proj = nn.Linear(feature_dim, hidden_dim)
 
@@ -108,13 +110,16 @@ class TemporalAttentionScorer(nn.Module):
         self.long_out_norm = nn.LayerNorm(hidden_dim)
 
         gate_hidden = max(hidden_dim // 2, 64)
-        self.long_gate = nn.Sequential(
-            nn.Linear(hidden_dim * 3 + 2, gate_hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(gate_hidden, 1),
-        )
-
-        fusion_in_dim = hidden_dim * 3 + 5
+        if self.use_long_memory:
+            self.long_gate = nn.Sequential(
+                nn.Linear(hidden_dim * 3 + 2, gate_hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(gate_hidden, 1),
+            )
+            fusion_in_dim = hidden_dim * 3 + 9
+        else:
+            self.long_gate = None
+            fusion_in_dim = hidden_dim * 2 + 6
         self.fusion = nn.Sequential(
             nn.Linear(fusion_in_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -297,6 +302,8 @@ class TemporalAttentionScorer(nn.Module):
         return long_vec
 
     def _compute_long_gate(self, det_vec, short_vec, long_vec):
+        if not self.use_long_memory:
+            raise RuntimeError("_compute_long_gate should not be called when use_long_memory=False")
         det_unit = F.normalize(det_vec, dim=-1)
         short_unit = F.normalize(short_vec, dim=-1)
         long_unit = F.normalize(long_vec, dim=-1)
@@ -306,6 +313,30 @@ class TemporalAttentionScorer(nn.Module):
         gate_input = torch.cat([det_vec, short_vec, long_vec, sim_short, sim_long], dim=-1)
         long_gate = torch.sigmoid(self.long_gate(gate_input))
         return long_gate, sim_short, sim_long
+
+    def _compute_raw_short_similarity(self, det_feat, hist_feat, short_hist_len):
+        hist_feat = hist_feat[:, : self.history_len, :]
+        det_unit = F.normalize(det_feat, dim=-1)
+        hist_unit = F.normalize(hist_feat, dim=-1)
+        raw_cos = (det_unit.unsqueeze(1) * hist_unit).sum(dim=-1)
+        mask = self._build_key_padding_mask(
+            short_hist_len, raw_cos.size(1), raw_cos.device
+        )
+        if mask is not None:
+            raw_cos_for_max = raw_cos.masked_fill(mask, -1.0)
+            raw_cos_for_min = raw_cos.masked_fill(mask, 1.0)
+            valid = (~mask).float()
+            denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+            raw_mean = (raw_cos * valid).sum(dim=1, keepdim=True) / denom
+        else:
+            raw_cos_for_max = raw_cos
+            raw_cos_for_min = raw_cos
+            raw_mean = raw_cos.mean(dim=1, keepdim=True)
+        raw_latest = raw_cos[:, :1]
+        raw_max = raw_cos_for_max.max(dim=1, keepdim=True).values
+        raw_min = raw_cos_for_min.min(dim=1, keepdim=True).values
+        raw_summary = torch.cat([raw_latest, raw_mean, raw_max, raw_min], dim=-1)
+        return (raw_summary - 0.98) * 50.0
 
     def forward(
         self,
@@ -334,14 +365,18 @@ class TemporalAttentionScorer(nn.Module):
                 input_tokens=input_tokens,
                 return_attention=True,
             )
-            long_vec, long_attn = self.encode_long_memory(
-                det_feat,
-                hist_feat,
-                long_hist_feat=long_hist_feat,
-                long_hist_len=long_hist_len,
-                input_tokens=input_tokens,
-                return_attention=True,
-            )
+            if self.use_long_memory:
+                long_vec, long_attn = self.encode_long_memory(
+                    det_feat,
+                    hist_feat,
+                    long_hist_feat=long_hist_feat,
+                    long_hist_len=long_hist_len,
+                    input_tokens=input_tokens,
+                    return_attention=True,
+                )
+            else:
+                long_vec = torch.zeros_like(short_vec)
+                long_attn = None
         else:
             short_vec = self.encode_short_memory(
                 det_feat,
@@ -351,33 +386,57 @@ class TemporalAttentionScorer(nn.Module):
                 input_tokens=input_tokens,
                 return_attention=False,
             )
-            long_vec = self.encode_long_memory(
-                det_feat,
-                hist_feat,
-                long_hist_feat=long_hist_feat,
-                long_hist_len=long_hist_len,
-                input_tokens=input_tokens,
-                return_attention=False,
-            )
+            if self.use_long_memory:
+                long_vec = self.encode_long_memory(
+                    det_feat,
+                    hist_feat,
+                    long_hist_feat=long_hist_feat,
+                    long_hist_len=long_hist_len,
+                    input_tokens=input_tokens,
+                    return_attention=False,
+                )
+            else:
+                long_vec = torch.zeros_like(short_vec)
             short_attn = None
             long_attn = None
 
-        long_gate, sim_short, sim_long = self._compute_long_gate(det_vec, short_vec, long_vec)
-        gated_long_vec = long_gate * long_vec
-
-        fusion_input = torch.cat(
-            [
-                det_vec,
-                short_vec,
-                gated_long_vec,
-                long_gate,
-                sim_short,
-                sim_long,
-                sim_short - sim_long,
-                (short_vec * gated_long_vec).mean(dim=-1, keepdim=True),
-            ],
-            dim=-1,
+        det_unit = F.normalize(det_vec, dim=-1)
+        short_unit = F.normalize(short_vec, dim=-1)
+        sim_short = (det_unit * short_unit).sum(dim=-1, keepdim=True)
+        raw_short_sim = self._compute_raw_short_similarity(
+            det_feat, hist_feat, short_hist_len
         )
+        if self.use_long_memory:
+            long_gate, _, sim_long = self._compute_long_gate(det_vec, short_vec, long_vec)
+            gated_long_vec = long_gate * long_vec
+            fusion_input = torch.cat(
+                [
+                    det_vec,
+                    short_vec,
+                    gated_long_vec,
+                    long_gate,
+                    sim_short,
+                    sim_long,
+                    sim_short - sim_long,
+                    (short_vec * gated_long_vec).mean(dim=-1, keepdim=True),
+                    raw_short_sim,
+                ],
+                dim=-1,
+            )
+        else:
+            sim_long = torch.zeros_like(sim_short)
+            long_gate = torch.zeros_like(sim_short)
+            gated_long_vec = torch.zeros_like(short_vec)
+            fusion_input = torch.cat(
+                [
+                    det_vec,
+                    short_vec,
+                    sim_short,
+                    (det_vec * short_vec).mean(dim=-1, keepdim=True),
+                    raw_short_sim,
+                ],
+                dim=-1,
+            )
         fused = self.fusion(fusion_input)
         score = self.scorer(fused).squeeze(-1)
 

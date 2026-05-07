@@ -174,6 +174,7 @@ class opts:
         opt.k = 3 # Number of top distances to consider for k-top cosine distance(in nn_matching.py, _cosine_distance_to_memory function)
         opt.ambiguity_distance_threshold = 0.02
         opt.ambiguity_margin = 0.003
+        opt.match_conf_margin_scale = 0.02
         opt.phase_old_sim_threshold = 0.45
         opt.phase_short_sim_threshold = 0.75
         opt.phase_consistency_threshold = 0.75

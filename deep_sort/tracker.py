@@ -1,6 +1,7 @@
 # vim: expandtab:ts=4:sw=4
 from __future__ import absolute_import
 import numpy as np
+import torch
 from . import kalman_filter
 from . import linear_assignment
 from . import iou_matching
@@ -35,16 +36,245 @@ class Tracker:
 
     """
 
-    def __init__(self, metric, max_iou_distance=0.7, max_age=30, n_init=10):
+    def __init__(self, metric, max_iou_distance=0.7, max_age=30, n_init=10,
+                 temporal_model=None, temporal_alpha=1.0,
+                 fuse_temporal_model=False, temporal_max_correction=0.02,
+                 temporal_min_scale=0.02):
         self.metric = metric
         self.max_iou_distance = max_iou_distance
         self.max_age = max_age
         self.n_init = n_init
+        self.temporal_model = temporal_model
+        self.temporal_alpha = float(temporal_alpha)
+        self.fuse_temporal_model = bool(fuse_temporal_model)
+        self.temporal_max_correction = float(temporal_max_correction)
+        self.temporal_min_scale = float(temporal_min_scale)
 
         self.tracks = []
         self._next_id = 1
         self.last_ambiguous_tracks = []
         self.last_ambiguous_info = {}
+        self.last_match_confidences = {}
+
+    @staticmethod
+    def _build_short_history(track, history_len):
+        short_memory = getattr(track, "short_memory", [])
+        if len(short_memory) > 0:
+            valid_len = min(len(short_memory), history_len)
+            items = [np.asarray(feat, dtype=np.float32) for feat in short_memory[-history_len:]][::-1]
+            while len(items) < history_len:
+                items.append(items[-1])
+            return np.stack(items, axis=0), valid_len
+
+        history = getattr(track, "det_feat_history", [])
+        if len(history) > 0:
+            valid_len = min(len(history), history_len)
+            items = [np.asarray(feat, dtype=np.float32) for feat in history[-history_len:]][::-1]
+            while len(items) < history_len:
+                items.append(items[-1])
+            return np.stack(items, axis=0), valid_len
+        return None
+
+    @staticmethod
+    def _build_long_history(track, long_history_len):
+        long_memory = getattr(track, "long_memory", [])
+        if len(long_memory) > 0:
+            valid_len = min(len(long_memory), long_history_len)
+            items = [np.asarray(feat, dtype=np.float32) for feat in long_memory[-long_history_len:]]
+            while len(items) < long_history_len:
+                items.append(items[-1])
+            return np.stack(items, axis=0), valid_len
+
+        history = getattr(track, "det_feat_history", [])
+        if len(history) > 0:
+            valid_len = min(len(history), long_history_len)
+            items = [np.asarray(feat, dtype=np.float32) for feat in history[-long_history_len:]]
+            while len(items) < long_history_len:
+                items.append(items[-1])
+            return np.stack(items, axis=0), valid_len
+        return None
+
+    @staticmethod
+    def _normalize_cost_rows(cost_matrix):
+        normalized = cost_matrix.copy().astype(np.float32)
+        big_cost = linear_assignment.INFTY_COST
+        for row_idx in range(normalized.shape[0]):
+            row = normalized[row_idx]
+            valid_mask = row < big_cost
+            if not np.any(valid_mask):
+                continue
+            valid = row[valid_mask]
+            min_v = float(np.min(valid))
+            max_v = float(np.max(valid))
+            if max_v - min_v < 1e-12:
+                normalized[row_idx, valid_mask] = 0.0
+            else:
+                normalized[row_idx, valid_mask] = (valid - min_v) / (max_v - min_v)
+        return normalized
+
+    def _temporal_cost_matrix(self, tracks, detections, track_indices, detection_indices):
+        if self.temporal_model is None or not self.fuse_temporal_model:
+            return None
+        if len(track_indices) == 0 or len(detection_indices) == 0:
+            return None
+
+        history_len = getattr(self.temporal_model, "history_len", 5)
+        long_history_len = getattr(self.temporal_model, "long_history_len", 30)
+        det_batch = []
+        short_batch = []
+        long_batch = []
+        short_len_batch = []
+        long_len_batch = []
+        pair_indices = []
+        temporal_cost = np.ones((len(track_indices), len(detection_indices)), dtype=np.float32)
+
+        for row, track_idx in enumerate(track_indices):
+            track = tracks[track_idx]
+            short_result = self._build_short_history(track, history_len)
+            if short_result is None:
+                continue
+            short_hist, short_len = short_result
+            long_result = self._build_long_history(track, long_history_len)
+            if long_result is None:
+                long_hist = np.repeat(short_hist[-1:, :], long_history_len, axis=0)
+                long_len = 1
+            else:
+                long_hist, long_len = long_result
+            for col, detection_idx in enumerate(detection_indices):
+                det_feat = np.asarray(detections[detection_idx].feature, dtype=np.float32)
+                norm = np.linalg.norm(det_feat)
+                if norm > 1e-12:
+                    det_feat = det_feat / norm
+                det_batch.append(det_feat)
+                short_batch.append(short_hist)
+                long_batch.append(long_hist)
+                short_len_batch.append(short_len)
+                long_len_batch.append(long_len)
+                pair_indices.append((row, col))
+
+        if not pair_indices:
+            return temporal_cost
+
+        with torch.no_grad():
+            logits = self.temporal_model(
+                torch.from_numpy(np.stack(det_batch, axis=0)),
+                torch.from_numpy(np.stack(short_batch, axis=0)),
+                long_hist_feat=torch.from_numpy(np.stack(long_batch, axis=0)),
+                short_hist_len=torch.from_numpy(np.asarray(short_len_batch, dtype=np.int64)),
+                long_hist_len=torch.from_numpy(np.asarray(long_len_batch, dtype=np.int64)),
+                return_attention=False,
+            )
+            probs = torch.sigmoid(logits).detach().cpu().numpy()
+
+        for idx, (row, col) in enumerate(pair_indices):
+            temporal_cost[row, col] = 1.0 - float(probs[idx])
+        return temporal_cost
+
+    def _fuse_temporal_cost(self, base_cost, temporal_cost):
+        if temporal_cost is None:
+            return base_cost
+        gamma = max(self.temporal_alpha, 0.0)
+        fused = base_cost.copy()
+        big_cost = linear_assignment.INFTY_COST
+        min_scale = max(self.temporal_min_scale, 0.0)
+        max_correction = max(self.temporal_max_correction, 0.0)
+        eps = 1e-12
+
+        for row_idx in range(base_cost.shape[0]):
+            valid_mask = base_cost[row_idx] < big_cost
+            if np.sum(valid_mask) < 2:
+                continue
+            learned_row = temporal_cost[row_idx, valid_mask].astype(np.float32)
+            base_row = base_cost[row_idx, valid_mask].astype(np.float32)
+            learned_delta = learned_row - float(np.mean(learned_row))
+            learned_scale = float(np.std(learned_delta))
+            if learned_scale < eps:
+                continue
+            base_scale = float(np.std(base_row))
+            effective_scale = max(base_scale, min_scale)
+            beta = gamma * effective_scale / max(learned_scale, eps)
+            correction = beta * learned_delta
+            correction = np.clip(correction, -max_correction, max_correction)
+            fused[row_idx, valid_mask] = np.maximum(base_row + correction, 0.0)
+        return fused
+
+    @staticmethod
+    def _cost_to_confidence(cost, max_cost):
+        if max_cost <= 0:
+            return 0.0
+        value = 1.0 - float(cost) / float(max_cost)
+        return float(np.clip(value, 0.0, 1.0))
+
+    @staticmethod
+    def _assignment_cost(cost_matrix):
+        if cost_matrix.size == 0:
+            return None
+        big_cost = linear_assignment.INFTY_COST
+        indices = linear_assignment.linear_assignment(cost_matrix.copy())
+        if len(indices) == 0:
+            return None
+        total = 0.0
+        for row, col in indices:
+            value = float(cost_matrix[row, col])
+            if value >= big_cost:
+                return None
+            total += value
+        return total
+
+    def _combo_match_confidences(self, matches, cost_lookup, max_cost):
+        if not matches:
+            return {}
+
+        matched_tracks = [track_idx for track_idx, _ in matches]
+        matched_detections = [detection_idx for _, detection_idx in matches]
+        detection_candidates = list(matched_detections)
+        for track_idx in matched_tracks:
+            for lookup_track_idx, detection_idx in cost_lookup.keys():
+                if lookup_track_idx == track_idx and detection_idx not in detection_candidates:
+                    detection_candidates.append(detection_idx)
+        big_cost = linear_assignment.INFTY_COST
+        cost_matrix = np.full(
+            (len(matched_tracks), len(detection_candidates)),
+            big_cost,
+            dtype=np.float32,
+        )
+
+        for row, track_idx in enumerate(matched_tracks):
+            for col, detection_idx in enumerate(detection_candidates):
+                cost_matrix[row, col] = float(
+                    cost_lookup.get((track_idx, detection_idx), big_cost)
+                )
+
+        current_total = 0.0
+        for row, (track_idx, detection_idx) in enumerate(matches):
+            col = detection_candidates.index(detection_idx)
+            cost = float(cost_matrix[row, col])
+            if cost >= big_cost:
+                return {
+                    pair: self._cost_to_confidence(
+                        cost_lookup.get(pair, max_cost), max_cost
+                    )
+                    for pair in matches
+                }
+            current_total += cost
+
+        margin_scale = max(float(getattr(opt, "match_conf_margin_scale", 0.02)), 1e-12)
+        confidences = {}
+        for row, (track_idx, detection_idx) in enumerate(matches):
+            col = detection_candidates.index(detection_idx)
+            matched_cost = float(cost_matrix[row, col])
+            alternative_matrix = cost_matrix.copy()
+            alternative_matrix[row, col] = big_cost
+            alternative_total = self._assignment_cost(alternative_matrix)
+
+            absolute_conf = self._cost_to_confidence(matched_cost, max_cost)
+            if alternative_total is None:
+                combo_conf = 1.0
+            else:
+                combo_margin = float(alternative_total - current_total)
+                combo_conf = float(np.clip(combo_margin / margin_scale, 0.0, 1.0))
+            confidences[(track_idx, detection_idx)] = absolute_conf * combo_conf
+        return confidences
 
     def predict(self):
         """Propagate track state distributions one time step forward.
@@ -94,6 +324,10 @@ class Tracker:
             np.asarray(features), np.asarray(targets), active_targets)
 
     def _match(self, detections):
+        self.last_match_confidences = {}
+        for track in self.tracks:
+            track.match_confidence = None
+        match_costs = {}
 
         def gated_metric(tracks, dets, track_indices, detection_indices):
             features = np.array([dets[i].feature for i in detection_indices])
@@ -103,9 +337,16 @@ class Tracker:
             else:
                 targets = np.array([tracks[i].track_id for i in track_indices])
                 cost_matrix = self.metric.distance(features, targets)
+            temporal_cost = self._temporal_cost_matrix(
+                tracks, dets, track_indices, detection_indices
+            )
+            cost_matrix = self._fuse_temporal_cost(cost_matrix, temporal_cost)
             cost_matrix = linear_assignment.gate_cost_matrix(
                 cost_matrix, tracks, dets, track_indices,
                 detection_indices)
+            for row, track_idx in enumerate(track_indices):
+                for col, detection_idx in enumerate(detection_indices):
+                    match_costs[(track_idx, detection_idx)] = float(cost_matrix[row, col])
 
             return cost_matrix
 
@@ -171,6 +412,34 @@ class Tracker:
                 detections, iou_track_candidates, unmatched_detections)
 
         matches = matches_a + matches_b
+        appearance_confidences = self._combo_match_confidences(
+            matches_a, match_costs, self.metric.matching_threshold
+        )
+        for track_idx, detection_idx in matches_a:
+            confidence = appearance_confidences.get((track_idx, detection_idx), 0.0)
+            self.tracks[track_idx].match_confidence = confidence
+            self.last_match_confidences[(track_idx, detection_idx)] = confidence
+        if matches_b:
+            iou_costs = {}
+            iou_track_indices = [track_idx for track_idx, _ in matches_b]
+            iou_detection_indices = [detection_idx for _, detection_idx in matches_b]
+            if iou_track_indices and iou_detection_indices:
+                iou_matrix = iou_matching.iou_cost(
+                    self.tracks,
+                    detections,
+                    iou_track_indices,
+                    iou_detection_indices,
+                )
+                for row, track_idx in enumerate(iou_track_indices):
+                    for col, detection_idx in enumerate(iou_detection_indices):
+                        iou_costs[(track_idx, detection_idx)] = float(iou_matrix[row, col])
+            iou_confidences = self._combo_match_confidences(
+                matches_b, iou_costs, self.max_iou_distance
+            )
+            for track_idx, detection_idx in matches_b:
+                confidence = iou_confidences.get((track_idx, detection_idx), 0.0)
+                self.tracks[track_idx].match_confidence = confidence
+                self.last_match_confidences[(track_idx, detection_idx)] = confidence
         unmatched_tracks = list(set(unmatched_tracks_a + unmatched_tracks_b))
         return matches, unmatched_tracks, unmatched_detections
 

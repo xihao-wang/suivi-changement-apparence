@@ -127,8 +127,13 @@ class Visualization(object):
             if not track.is_confirmed() or track.time_since_update > 0:
                 continue
             self.viewer.color = create_unique_color_uchar(track.track_id)
+            match_confidence = getattr(track, "match_confidence", None)
+            if match_confidence is None:
+                label = str(track.track_id)
+            else:
+                label = "%d %.2f" % (track.track_id, match_confidence)
             self.viewer.rectangle(
-                *track.to_tlwh().astype(int), label=str(track.track_id))
+                *track.to_tlwh().astype(int), label=label)
             # self.viewer.gaussian(track.mean[:2], track.covariance[:2, :2],
             #                      label="%d" % track.track_id)
 #
