@@ -55,6 +55,17 @@ class Tracker:
         self.last_ambiguous_tracks = []
         self.last_ambiguous_info = {}
         self.last_match_confidences = {}
+        self.temporal_cost_override = None
+
+    def set_temporal_cost_override(self, track_indices, detection_indices, temporal_cost):
+        self.temporal_cost_override = {
+            "track_indices": list(track_indices),
+            "detection_indices": list(detection_indices),
+            "temporal_cost": np.asarray(temporal_cost, dtype=np.float32),
+        }
+
+    def clear_temporal_cost_override(self):
+        self.temporal_cost_override = None
 
     @staticmethod
     def _build_short_history(track, history_len):
@@ -113,9 +124,28 @@ class Tracker:
         return normalized
 
     def _temporal_cost_matrix(self, tracks, detections, track_indices, detection_indices):
-        if self.temporal_model is None or not self.fuse_temporal_model:
+        if not self.fuse_temporal_model:
             return None
         if len(track_indices) == 0 or len(detection_indices) == 0:
+            return None
+        if self.temporal_cost_override is not None:
+            override = self.temporal_cost_override
+            source_tracks = override["track_indices"]
+            source_dets = override["detection_indices"]
+            source_cost = override["temporal_cost"]
+            aligned = np.ones((len(track_indices), len(detection_indices)), dtype=np.float32)
+            source_track_to_row = {track_idx: row for row, track_idx in enumerate(source_tracks)}
+            source_det_to_col = {det_idx: col for col, det_idx in enumerate(source_dets)}
+            for row, track_idx in enumerate(track_indices):
+                source_row = source_track_to_row.get(track_idx)
+                if source_row is None:
+                    continue
+                for col, detection_idx in enumerate(detection_indices):
+                    source_col = source_det_to_col.get(detection_idx)
+                    if source_col is not None:
+                        aligned[row, col] = source_cost[source_row, source_col]
+            return aligned
+        if self.temporal_model is None:
             return None
 
         history_len = getattr(self.temporal_model, "history_len", 5)

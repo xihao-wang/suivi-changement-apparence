@@ -238,6 +238,40 @@ def _compute_temporal_scores(candidate_tracks, detections, model):
     return score_matrix
 
 
+def _compute_debug_matrices(tracker, detections, learned_score_matrix=None):
+    from deep_sort import linear_assignment
+
+    confirmed_track_indices = [
+        idx for idx, track in enumerate(tracker.tracks) if track.is_confirmed()
+    ]
+    detection_indices = list(range(len(detections)))
+    candidate_tracks = [tracker.tracks[idx] for idx in confirmed_track_indices]
+    if not candidate_tracks or not detections:
+        empty = np.zeros((len(candidate_tracks), len(detections)), dtype=np.float32)
+        return confirmed_track_indices, empty, empty.copy(), empty.copy()
+
+    features = np.array([detections[i].feature for i in detection_indices])
+    appearance_cost, final_cost = tracker.metric.distance_components_with_memory(
+        features, candidate_tracks
+    )
+    if (
+        learned_score_matrix is not None
+        and tracker.temporal_model is not None
+        and tracker.fuse_temporal_model
+    ):
+        learned_prob = 1.0 / (1.0 + np.exp(-learned_score_matrix))
+        temporal_cost = 1.0 - learned_prob
+        final_cost = tracker._fuse_temporal_cost(final_cost, temporal_cost)
+    gated_cost = linear_assignment.gate_cost_matrix(
+        final_cost.copy(),
+        tracker.tracks,
+        detections,
+        confirmed_track_indices,
+        detection_indices,
+    )
+    return confirmed_track_indices, appearance_cost, final_cost, gated_cost
+
+
 def run(sequence_dir, detection_file, output_file, min_confidence,
         nms_max_overlap, min_detection_height, max_cosine_distance,
         nn_budget, display, learned_temporal=False, temporal_model_ckpt=None,
@@ -318,16 +352,38 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
             tracker.camera_update(sequence_dir.split('/')[-1], frame_idx)
 
         tracker.predict()
+        temporal_score_row = None
         if temporal_model is not None:
             candidate_tracks = [track for track in tracker.tracks if track.is_confirmed()]
             score_matrix = _compute_temporal_scores(candidate_tracks, detections, temporal_model)
-            temporal_score_rows.append({
+            temporal_score_row = {
                 "frame": int(frame_idx),
                 "track_ids": [int(track.track_id) for track in candidate_tracks],
                 "detection_indices": list(range(len(detections))),
                 "scores": score_matrix.tolist(),
-            })
+            }
+        elif temporal_scores_file:
+            temporal_score_row = {
+                "frame": int(frame_idx),
+                "track_ids": [],
+                "detection_indices": list(range(len(detections))),
+                "scores": [],
+            }
+        if temporal_score_row is not None:
+            matrix_track_indices, appearance_cost, final_cost, gated_cost = _compute_debug_matrices(
+                tracker,
+                detections,
+                learned_score_matrix=score_matrix if temporal_model is not None else None,
+            )
+            temporal_score_row["matrix_track_ids"] = [
+                int(tracker.tracks[idx].track_id) for idx in matrix_track_indices
+            ]
+            temporal_score_row["appearance_cost_matrix"] = appearance_cost.tolist()
+            temporal_score_row["final_cost_matrix"] = final_cost.tolist()
+            temporal_score_row["gated_cost_matrix"] = gated_cost.tolist()
         tracker.update(detections)
+        if temporal_score_row is not None:
+            temporal_score_rows.append(temporal_score_row)
 
         # Update visualization.
         if display:

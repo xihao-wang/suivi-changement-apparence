@@ -72,6 +72,32 @@ def _load_temporal_scores_jsonl(path: str | None) -> dict[int, dict[str, Any]]:
     return score_by_frame
 
 
+def _align_precomputed_score_matrix(
+    precomputed: dict[str, Any],
+    expected_track_ids: list[int],
+    expected_detection_indices: list[int],
+) -> tuple[np.ndarray | None, bool]:
+    file_track_ids = [int(x) for x in precomputed.get("track_ids", [])]
+    file_detection_indices = [int(x) for x in precomputed.get("detection_indices", [])]
+    source_matrix = np.asarray(precomputed.get("scores", []), dtype=np.float32)
+    if source_matrix.shape != (len(file_track_ids), len(file_detection_indices)):
+        return None, False
+
+    track_to_row = {track_id: row for row, track_id in enumerate(file_track_ids)}
+    det_to_col = {det_idx: col for col, det_idx in enumerate(file_detection_indices)}
+    aligned = np.zeros((len(expected_track_ids), len(expected_detection_indices)), dtype=np.float32)
+    for row, track_id in enumerate(expected_track_ids):
+        source_row = track_to_row.get(track_id)
+        if source_row is None:
+            return None, False
+        for col, det_idx in enumerate(expected_detection_indices):
+            source_col = det_to_col.get(det_idx)
+            if source_col is None:
+                return None, False
+            aligned[row, col] = source_matrix[source_row, source_col]
+    return aligned, True
+
+
 def _format_bbox(tlwh) -> str:
     return f"[{tlwh[0]:.1f}, {tlwh[1]:.1f}, {tlwh[2]:.1f}, {tlwh[3]:.1f}]"
 
@@ -179,20 +205,15 @@ def build_reports(
                 if precomputed is not None:
                     expected_track_ids = [int(track.track_id) for track in candidate_tracks]
                     expected_detection_indices = list(range(len(detections)))
-                    file_track_ids = [int(x) for x in precomputed.get("track_ids", [])]
-                    file_detection_indices = [int(x) for x in precomputed.get("detection_indices", [])]
-                    if (
-                        file_track_ids == expected_track_ids
-                        and file_detection_indices == expected_detection_indices
-                    ):
-                        learned_score_candidate = np.asarray(
-                            precomputed.get("scores", []), dtype=np.float32
-                        )
-                        if learned_score_candidate.shape == (len(candidate_tracks), len(detections)):
-                            learned_score = learned_score_candidate
-                            learned_short_attn = []
-                            learned_diag = _empty_learned_diagnostics(len(candidate_tracks), len(detections))
-                            precomputed_ok = True
+                    learned_score_candidate, precomputed_ok = _align_precomputed_score_matrix(
+                        precomputed,
+                        expected_track_ids,
+                        expected_detection_indices,
+                    )
+                    if precomputed_ok:
+                        learned_score = learned_score_candidate
+                        learned_short_attn = []
+                        learned_diag = _empty_learned_diagnostics(len(candidate_tracks), len(detections))
                 if not precomputed_ok:
                     if learned_temporal_model is None:
                         raise ValueError(
@@ -216,6 +237,13 @@ def build_reports(
                 learned_prob = 1.0 / (1.0 + np.exp(-learned_score))
                 temporal_cost = 1.0 - learned_prob
                 final_cost = tracker._fuse_temporal_cost(final_cost, temporal_cost)
+                tracker.set_temporal_cost_override(
+                    confirmed_track_indices,
+                    detection_indices,
+                    temporal_cost,
+                )
+            else:
+                tracker.clear_temporal_cost_override()
             raw_cost = final_cost
             gated_cost = linear_assignment.gate_cost_matrix(
                 raw_cost.copy(),
@@ -232,6 +260,7 @@ def build_reports(
             final_cost = np.zeros((len(candidate_tracks), len(detections)))
             raw_cost = np.zeros((len(candidate_tracks), len(detections)))
             gated_cost = raw_cost.copy()
+            tracker.clear_temporal_cost_override()
 
         matches, unmatched_tracks, unmatched_detections = tracker._match(detections)
 
