@@ -102,6 +102,234 @@ def _format_bbox(tlwh) -> str:
     return f"[{tlwh[0]:.1f}, {tlwh[1]:.1f}, {tlwh[2]:.1f}, {tlwh[3]:.1f}]"
 
 
+def _load_result_txt(path: str | None) -> dict[int, list[dict[str, Any]]]:
+    if not path:
+        return {}
+    result_by_frame: dict[int, list[dict[str, Any]]] = {}
+    with open(path, "r") as f:
+        for line in f:
+            row = line.strip()
+            if not row:
+                continue
+            parts = row.split(",")
+            if len(parts) < 6:
+                continue
+            frame = int(float(parts[0]))
+            track_id = int(float(parts[1]))
+            tlwh = [float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])]
+            match_confidence = None
+            if len(parts) >= 7:
+                try:
+                    match_confidence = float(parts[6])
+                except ValueError:
+                    match_confidence = None
+            result_by_frame.setdefault(frame, []).append(
+                {
+                    "track_id": track_id,
+                    "bbox_tlwh": tlwh,
+                    "match_confidence": match_confidence,
+                }
+            )
+    return result_by_frame
+
+
+def _bbox_iou_xywh(box_a, box_b) -> float:
+    ax1, ay1, aw, ah = box_a
+    bx1, by1, bw, bh = box_b
+    ax2, ay2 = ax1 + aw, ay1 + ah
+    bx2, by2 = bx1 + bw, by1 + bh
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter = inter_w * inter_h
+    if inter <= 0.0:
+        return 0.0
+    union = aw * ah + bw * bh - inter
+    if union <= 1e-12:
+        return 0.0
+    return float(inter / union)
+
+
+def _align_precomputed_matrix(
+    precomputed: dict[str, Any],
+    matrix_key: str,
+    expected_track_ids: list[int],
+    expected_detection_indices: list[int],
+    track_key: str = "matrix_track_ids",
+    det_key: str = "detection_indices",
+) -> np.ndarray:
+    file_track_ids = [int(x) for x in precomputed.get(track_key, [])]
+    file_detection_indices = [int(x) for x in precomputed.get(det_key, [])]
+    source_matrix = np.asarray(precomputed.get(matrix_key, []), dtype=np.float32)
+    aligned = np.zeros((len(expected_track_ids), len(expected_detection_indices)), dtype=np.float32)
+    if source_matrix.shape != (len(file_track_ids), len(file_detection_indices)):
+        return aligned
+
+    track_to_row = {track_id: row for row, track_id in enumerate(file_track_ids)}
+    det_to_col = {det_idx: col for col, det_idx in enumerate(file_detection_indices)}
+    for row, track_id in enumerate(expected_track_ids):
+        source_row = track_to_row.get(track_id)
+        if source_row is None:
+            continue
+        for col, det_idx in enumerate(expected_detection_indices):
+            source_col = det_to_col.get(det_idx)
+            if source_col is None:
+                continue
+            aligned[row, col] = source_matrix[source_row, source_col]
+    return aligned
+
+
+def _build_replay_reports(
+    sequence_dir: str,
+    detection_file: str,
+    result_file: str,
+    min_confidence: float,
+    nms_max_overlap: float,
+    min_detection_height: int,
+    temporal_scores_file: str | None = None,
+) -> tuple[list[FrameReport], int, int]:
+    from application_util import preprocessing
+    from deep_sort_app import create_detections, gather_sequence_info
+
+    seq_info = gather_sequence_info(sequence_dir, detection_file)
+    result_by_frame = _load_result_txt(result_file)
+    precomputed_scores_by_frame = _load_temporal_scores_jsonl(temporal_scores_file)
+
+    track_state: dict[int, dict[str, int]] = {}
+    reports: list[FrameReport] = []
+    min_frame = seq_info["min_frame_idx"]
+    max_frame = seq_info["max_frame_idx"]
+
+    for frame_idx in range(min_frame, max_frame + 1):
+        detections = create_detections(
+            seq_info["detections"], frame_idx, min_detection_height
+        )
+        detections = [d for d in detections if d.confidence >= min_confidence]
+
+        boxes = np.array([d.tlwh for d in detections])
+        scores = np.array([d.confidence for d in detections])
+        indices = preprocessing.non_max_suppression(boxes, nms_max_overlap, scores)
+        detections = [detections[i] for i in indices]
+
+        frame_tracks_raw = sorted(
+            result_by_frame.get(frame_idx, []),
+            key=lambda row: int(row["track_id"]),
+        )
+        tracks = []
+        for row in frame_tracks_raw:
+            track_id = int(row["track_id"])
+            state = track_state.get(track_id)
+            if state is None:
+                state = {"first_frame": frame_idx, "hits": 0}
+                track_state[track_id] = state
+            state["hits"] += 1
+            tracks.append(
+                {
+                    "track_id": track_id,
+                    "hits": state["hits"],
+                    "age": frame_idx - state["first_frame"] + 1,
+                    "time_since_update": 1,
+                    "match_confidence": row.get("match_confidence"),
+                    "bbox_tlwh": list(row["bbox_tlwh"]),
+                }
+            )
+
+        matches = []
+        unmatched_detection_indices = set(range(len(detections)))
+        used_tracks = set()
+        candidate_pairs = []
+        for tr_idx, tr in enumerate(tracks):
+            for det_idx, det in enumerate(detections):
+                iou = _bbox_iou_xywh(tr["bbox_tlwh"], det.tlwh)
+                if iou > 0.0:
+                    candidate_pairs.append((iou, tr_idx, det_idx))
+        for iou, tr_idx, det_idx in sorted(candidate_pairs, reverse=True):
+            if tr_idx in used_tracks or det_idx not in unmatched_detection_indices:
+                continue
+            used_tracks.add(tr_idx)
+            unmatched_detection_indices.remove(det_idx)
+            matches.append(
+                {
+                    "track_id": tracks[tr_idx]["track_id"],
+                    "detection_index": det_idx,
+                }
+            )
+
+        unmatched_track_ids = [
+            tr["track_id"] for tr_idx, tr in enumerate(tracks) if tr_idx not in used_tracks
+        ]
+
+        expected_track_ids = [int(tr["track_id"]) for tr in tracks]
+        expected_detection_indices = list(range(len(detections)))
+        precomputed = precomputed_scores_by_frame.get(frame_idx, {})
+
+        appearance_cost = _align_precomputed_matrix(
+            precomputed,
+            "appearance_cost_matrix",
+            expected_track_ids,
+            expected_detection_indices,
+        )
+        final_cost = _align_precomputed_matrix(
+            precomputed,
+            "final_cost_matrix",
+            expected_track_ids,
+            expected_detection_indices,
+        )
+        gated_cost = _align_precomputed_matrix(
+            precomputed,
+            "gated_cost_matrix",
+            expected_track_ids,
+            expected_detection_indices,
+        )
+        learned_score = _align_precomputed_matrix(
+            precomputed,
+            "scores",
+            expected_track_ids,
+            expected_detection_indices,
+            track_key="track_ids",
+            det_key="detection_indices",
+        )
+
+        report = FrameReport(
+            frame=frame_idx,
+            image_path=seq_info["image_filenames"][frame_idx],
+            detections=[
+                {
+                    "index": det_idx,
+                    "confidence": float(det.confidence),
+                    "bbox_tlwh": [float(x) for x in det.tlwh],
+                }
+                for det_idx, det in enumerate(detections)
+            ],
+            tracks=tracks,
+            appearance_cost_matrix=appearance_cost.tolist(),
+            learned_temporal_score_matrix=learned_score.tolist(),
+            learned_short_attn_matrices=[],
+            learned_short_attn_top_matrix=np.zeros_like(appearance_cost).tolist(),
+            learned_short_attn_entropy_matrix=np.zeros_like(appearance_cost).tolist(),
+            learned_short_similarity_matrix=np.zeros_like(appearance_cost).tolist(),
+            learned_long_gate_matrix=np.zeros_like(appearance_cost).tolist(),
+            learned_long_similarity_matrix=np.zeros_like(appearance_cost).tolist(),
+            learned_long_attn_recent_matrix=np.zeros_like(appearance_cost).tolist(),
+            learned_long_attn_top_matrix=np.zeros_like(appearance_cost).tolist(),
+            learned_long_attn_entropy_matrix=np.zeros_like(appearance_cost).tolist(),
+            final_cost_matrix=final_cost.tolist(),
+            raw_cost_matrix=final_cost.tolist(),
+            gated_cost_matrix=gated_cost.tolist(),
+            matches=matches,
+            unmatched_track_ids=unmatched_track_ids,
+            unmatched_detection_indices=sorted(unmatched_detection_indices),
+            ambiguous_track_ids=[],
+            ambiguous_info={},
+        )
+        reports.append(report)
+
+    return reports, min_frame, max_frame
+
+
 def build_reports(
     sequence_dir: str,
     detection_file: str,
@@ -243,15 +471,26 @@ def build_reports(
                     temporal_cost,
                 )
             else:
+                temporal_cost = None
                 tracker.clear_temporal_cost_override()
             raw_cost = final_cost
-            gated_cost = linear_assignment.gate_cost_matrix(
-                raw_cost.copy(),
-                tracker.tracks,
-                detections,
-                confirmed_track_indices,
-                detection_indices,
-            )
+            if enable_learned_temporal and fuse_learned_temporal and temporal_cost is not None and not opt.MC:
+                gated_cost = tracker._gate_cost_matrix_with_temporal_rescue(
+                    raw_cost.copy(),
+                    temporal_cost,
+                    tracker.tracks,
+                    detections,
+                    confirmed_track_indices,
+                    detection_indices,
+                )
+            else:
+                gated_cost = linear_assignment.gate_cost_matrix(
+                    raw_cost.copy(),
+                    tracker.tracks,
+                    detections,
+                    confirmed_track_indices,
+                    detection_indices,
+                )
         else:
             appearance_cost = np.zeros((len(candidate_tracks), len(detections)))
             learned_score = np.zeros((len(candidate_tracks), len(detections)))
@@ -745,6 +984,22 @@ class MatchViewerApp:
                 report,
             ),
         )
+        for token_idx, matrix in enumerate(report.learned_short_attn_matrices):
+            if token_idx == 0:
+                label = "short_memory[0] latest"
+            else:
+                label = f"short_memory[{token_idx}] older"
+            self.matrix_text.insert(
+                tk.END,
+                f"\nLearned attention from det_feat to {label}\n",
+            )
+            self.matrix_text.insert(tk.END, self.format_matrix(matrix, report))
+        self.matrix_text.insert(tk.END, "\nFinal cost matrix(before gating)\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.final_cost_matrix, report))
+        self.matrix_text.insert(tk.END, "\nGated distance matrix(motion / Kalman gating)\n")
+        self.matrix_text.insert(tk.END, self.format_matrix(report.gated_cost_matrix, report))
+        self.matrix_text.insert(tk.END, "\n" + "-" * 80 + "\n")
+        self.matrix_text.insert(tk.END, "Learned summary diagnostics\n")
         self.matrix_text.insert(tk.END, "\nLearned short summary: top attention\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.learned_short_attn_top_matrix, report))
         self.matrix_text.insert(tk.END, "\nLearned short summary: attention entropy\n")
@@ -761,20 +1016,6 @@ class MatchViewerApp:
         self.matrix_text.insert(tk.END, self.format_matrix(report.learned_long_attn_top_matrix, report))
         self.matrix_text.insert(tk.END, "\nLearned long summary: attention entropy\n")
         self.matrix_text.insert(tk.END, self.format_matrix(report.learned_long_attn_entropy_matrix, report))
-        for token_idx, matrix in enumerate(report.learned_short_attn_matrices):
-            if token_idx == 0:
-                label = "short_memory[0] latest"
-            else:
-                label = f"short_memory[{token_idx}] older"
-            self.matrix_text.insert(
-                tk.END,
-                f"\nLearned attention from det_feat to {label}\n",
-            )
-            self.matrix_text.insert(tk.END, self.format_matrix(matrix, report))
-        self.matrix_text.insert(tk.END, "\nFinal cost matrix(before gating)\n")
-        self.matrix_text.insert(tk.END, self.format_matrix(report.final_cost_matrix, report))
-        self.matrix_text.insert(tk.END, "\nGated distance matrix(motion / Kalman gating)\n")
-        self.matrix_text.insert(tk.END, self.format_matrix(report.gated_cost_matrix, report))
 
     @staticmethod
     def _sigmoid_matrix(matrix: list[list[float]]) -> list[list[float]]:
@@ -806,6 +1047,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Interactive viewer for track/detection matching.")
     parser.add_argument("--sequence_dir", required=True)
     parser.add_argument("--detection_file", required=True)
+    parser.add_argument("--result_file", default=None, help="Optional tracking result txt. If provided with --temporal_scores_file, viewer runs in pure replay mode without online tracker computation.")
     parser.add_argument("--BoT", action="store_true", help="Use BoT configuration")
     parser.add_argument("--ECC", action="store_true", help="Enable ECC")
     parser.add_argument("--NSA", action="store_true", help="Enable NSA")
@@ -873,25 +1115,36 @@ def main():
         opt.max_cosine_distance if args.max_cosine_distance is None else args.max_cosine_distance
     )
     nn_budget = opt.nn_budget if args.nn_budget is None else args.nn_budget
-    reports, min_frame, max_frame = build_reports(
-        sequence_dir=args.sequence_dir,
-        detection_file=args.detection_file,
-        min_confidence=min_confidence,
-        nms_max_overlap=nms_max_overlap,
-        min_detection_height=min_detection_height,
-        max_cosine_distance=max_cosine_distance,
-        nn_budget=nn_budget,
-        enable_learned_temporal=args.learned_temporal,
-        temporal_model_ckpt=args.temporal_model_ckpt,
-        temporal_hidden_dim=args.temporal_hidden_dim,
-        temporal_num_heads=args.temporal_num_heads,
-        temporal_stride=args.learned_temporal_stride,
-        temporal_alpha=args.learned_temporal_alpha,
-        fuse_learned_temporal=args.fuse_learned_temporal,
-        temporal_max_correction=args.learned_temporal_max_correction,
-        temporal_min_scale=args.learned_temporal_min_scale,
-        temporal_scores_file=args.temporal_scores_file,
-    )
+    if args.result_file and args.temporal_scores_file:
+        reports, min_frame, max_frame = _build_replay_reports(
+            sequence_dir=args.sequence_dir,
+            detection_file=args.detection_file,
+            result_file=args.result_file,
+            min_confidence=min_confidence,
+            nms_max_overlap=nms_max_overlap,
+            min_detection_height=min_detection_height,
+            temporal_scores_file=args.temporal_scores_file,
+        )
+    else:
+        reports, min_frame, max_frame = build_reports(
+            sequence_dir=args.sequence_dir,
+            detection_file=args.detection_file,
+            min_confidence=min_confidence,
+            nms_max_overlap=nms_max_overlap,
+            min_detection_height=min_detection_height,
+            max_cosine_distance=max_cosine_distance,
+            nn_budget=nn_budget,
+            enable_learned_temporal=args.learned_temporal,
+            temporal_model_ckpt=args.temporal_model_ckpt,
+            temporal_hidden_dim=args.temporal_hidden_dim,
+            temporal_num_heads=args.temporal_num_heads,
+            temporal_stride=args.learned_temporal_stride,
+            temporal_alpha=args.learned_temporal_alpha,
+            fuse_learned_temporal=args.fuse_learned_temporal,
+            temporal_max_correction=args.learned_temporal_max_correction,
+            temporal_min_scale=args.learned_temporal_min_scale,
+            temporal_scores_file=args.temporal_scores_file,
+        )
     print(f"Loaded {len(reports)} frames.")
     root = tk.Tk()
     MatchViewerApp(root, reports, min_frame, max_frame)

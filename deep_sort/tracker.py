@@ -226,7 +226,79 @@ class Tracker:
             correction = beta * learned_delta
             correction = np.clip(correction, -max_correction, max_correction)
             fused[row_idx, valid_mask] = np.maximum(base_row + correction, 0.0)
+
+        # Row-wise correction handles "one track chooses among detections".
+        # Column-wise correction handles "multiple tracks compete for one detection".
+        for col_idx in range(base_cost.shape[1]):
+            valid_mask = base_cost[:, col_idx] < big_cost
+            if np.sum(valid_mask) < 2:
+                continue
+            learned_col = temporal_cost[valid_mask, col_idx].astype(np.float32)
+            base_col = base_cost[valid_mask, col_idx].astype(np.float32)
+            learned_delta = learned_col - float(np.mean(learned_col))
+            learned_scale = float(np.std(learned_delta))
+            if learned_scale < eps:
+                continue
+            base_scale = float(np.std(base_col))
+            effective_scale = max(base_scale, min_scale)
+            beta = gamma * effective_scale / max(learned_scale, eps)
+            correction = beta * learned_delta
+            correction = np.clip(correction, -max_correction, max_correction)
+            fused[valid_mask, col_idx] = np.maximum(fused[valid_mask, col_idx] + correction, 0.0)
         return fused
+
+    def _gate_cost_matrix_with_temporal_rescue(
+            self, cost_matrix, temporal_cost, tracks, detections,
+            track_indices, detection_indices, gated_cost=linear_assignment.INFTY_COST):
+        assert not opt.MC
+        if len(track_indices) == 0 or len(detection_indices) == 0:
+            return cost_matrix
+
+        gating_threshold = kalman_filter.chi2inv95[4]
+        rescue_gating_multiplier = 2.0
+        temperature = 0.5
+        measurements = np.asarray([detections[i].to_xyah() for i in detection_indices])
+
+        for row, track_idx in enumerate(track_indices):
+            track = tracks[track_idx]
+            gating_distance = track.kf.gating_distance(
+                track.mean, track.covariance, measurements, only_position=False
+            )
+            gated_mask = gating_distance > gating_threshold
+            if not np.any(gated_mask):
+                continue
+
+            if temporal_cost is None or temporal_cost.shape != cost_matrix.shape:
+                cost_matrix[row, gated_mask] = gated_cost
+                continue
+
+            temporal_row = temporal_cost[row].astype(np.float32)
+            valid_temporal = np.isfinite(temporal_row)
+            if np.sum(valid_temporal) < 2:
+                cost_matrix[row, gated_mask] = gated_cost
+                continue
+
+            logits = -temporal_row[valid_temporal]
+            logits = logits / max(temperature, 1e-12)
+            logits = logits - float(np.max(logits))
+            probs = np.exp(logits)
+            probs = probs / max(float(np.sum(probs)), 1e-12)
+            valid_cols = np.flatnonzero(valid_temporal)
+            best_local = int(np.argmax(probs))
+            best_col = int(valid_cols[best_local])
+            prominence = float(np.mean(probs) + np.std(probs))
+
+            for col, is_gated in enumerate(gated_mask):
+                if not is_gated:
+                    continue
+                rescue = (
+                    col == best_col
+                    and float(probs[best_local]) >= prominence
+                    and float(gating_distance[col]) <= gating_threshold * rescue_gating_multiplier
+                )
+                if not rescue:
+                    cost_matrix[row, col] = gated_cost
+        return cost_matrix
 
     @staticmethod
     def _cost_to_confidence(cost, max_cost):
@@ -371,9 +443,14 @@ class Tracker:
                 tracks, dets, track_indices, detection_indices
             )
             cost_matrix = self._fuse_temporal_cost(cost_matrix, temporal_cost)
-            cost_matrix = linear_assignment.gate_cost_matrix(
-                cost_matrix, tracks, dets, track_indices,
-                detection_indices)
+            if self.fuse_temporal_model and temporal_cost is not None and not opt.MC:
+                cost_matrix = self._gate_cost_matrix_with_temporal_rescue(
+                    cost_matrix, temporal_cost, tracks, dets,
+                    track_indices, detection_indices)
+            else:
+                cost_matrix = linear_assignment.gate_cost_matrix(
+                    cost_matrix, tracks, dets, track_indices,
+                    detection_indices)
             for row, track_idx in enumerate(track_indices):
                 for col, detection_idx in enumerate(detection_indices):
                     match_costs[(track_idx, detection_idx)] = float(cost_matrix[row, col])

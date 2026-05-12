@@ -240,6 +240,7 @@ def _compute_temporal_scores(candidate_tracks, detections, model):
 
 def _compute_debug_matrices(tracker, detections, learned_score_matrix=None):
     from deep_sort import linear_assignment
+    from opts import opt
 
     confirmed_track_indices = [
         idx for idx, track in enumerate(tracker.tracks) if track.is_confirmed()
@@ -262,13 +263,31 @@ def _compute_debug_matrices(tracker, detections, learned_score_matrix=None):
         learned_prob = 1.0 / (1.0 + np.exp(-learned_score_matrix))
         temporal_cost = 1.0 - learned_prob
         final_cost = tracker._fuse_temporal_cost(final_cost, temporal_cost)
-    gated_cost = linear_assignment.gate_cost_matrix(
-        final_cost.copy(),
-        tracker.tracks,
-        detections,
-        confirmed_track_indices,
-        detection_indices,
-    )
+    else:
+        temporal_cost = None
+    if (
+        learned_score_matrix is not None
+        and tracker.temporal_model is not None
+        and tracker.fuse_temporal_model
+        and temporal_cost is not None
+        and not opt.MC
+    ):
+        gated_cost = tracker._gate_cost_matrix_with_temporal_rescue(
+            final_cost.copy(),
+            temporal_cost,
+            tracker.tracks,
+            detections,
+            confirmed_track_indices,
+            detection_indices,
+        )
+    else:
+        gated_cost = linear_assignment.gate_cost_matrix(
+            final_cost.copy(),
+            tracker.tracks,
+            detections,
+            confirmed_track_indices,
+            detection_indices,
+        )
     return confirmed_track_indices, appearance_cost, final_cost, gated_cost
 
 
