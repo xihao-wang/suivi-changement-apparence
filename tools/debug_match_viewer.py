@@ -17,6 +17,7 @@ import torch
 import tkinter as tk
 from PIL import Image, ImageTk
 from tkinter import font as tkfont
+from tkinter import simpledialog
 from tkinter import ttk
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +56,69 @@ class FrameReport:
     unmatched_detection_indices: list[int]
     ambiguous_track_ids: list[int]
     ambiguous_info: dict[int, dict[str, Any]]
+
+
+def _load_gt_work_file(path: str | None) -> dict[int, list[dict[str, Any]]]:
+    if not path or not Path(path).exists():
+        return {}
+    with open(path, "r") as f:
+        data = json.load(f)
+    frames = data.get("frames", data)
+    gt_by_frame: dict[int, list[dict[str, Any]]] = {}
+    for frame_key, boxes in frames.items():
+        gt_by_frame[int(frame_key)] = [
+            {
+                "gt_id": int(box["gt_id"]),
+                "bbox_tlwh": [float(x) for x in box["bbox_tlwh"]],
+            }
+            for box in boxes
+        ]
+    return gt_by_frame
+
+
+def _save_gt_work_file(path: str, gt_by_frame: dict[int, list[dict[str, Any]]]) -> None:
+    output = {
+        "format": "debug_match_viewer_gt_work_v1",
+        "frames": {
+            str(frame): [
+                {
+                    "gt_id": int(box["gt_id"]),
+                    "bbox_tlwh": [float(x) for x in box["bbox_tlwh"]],
+                }
+                for box in boxes
+            ]
+            for frame, boxes in sorted(gt_by_frame.items())
+            if boxes
+        },
+    }
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(output, f, indent=2)
+
+
+def _export_gt_mot(path: str, gt_by_frame: dict[int, list[dict[str, Any]]]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for frame, boxes in sorted(gt_by_frame.items()):
+        for box in boxes:
+            gt_id = int(box["gt_id"])
+            if gt_id <= 0:
+                continue
+            x, y, w, h = [float(v) for v in box["bbox_tlwh"]]
+            if w <= 0.0 or h <= 0.0:
+                continue
+            rows.append((frame, gt_id, x, y, w, h))
+    with open(path, "w") as f:
+        for frame, gt_id, x, y, w, h in rows:
+            f.write(f"{frame},{gt_id},{x:.2f},{y:.2f},{w:.2f},{h:.2f},1,1,1\n")
+
+
+def _default_gt_work_file(sequence_dir: str) -> str:
+    return str(Path(sequence_dir) / "gt" / "gt_work.json")
+
+
+def _default_gt_output_file(sequence_dir: str) -> str:
+    return str(Path(sequence_dir) / "gt" / "gt.txt")
 
 
 def _load_temporal_scores_jsonl(path: str | None) -> dict[int, dict[str, Any]]:
@@ -740,7 +804,17 @@ def _compute_learned_temporal_matrices(candidate_tracks, detections, model, stri
 
 
 class MatchViewerApp:
-    def __init__(self, root: tk.Tk, reports: list[FrameReport], min_frame: int, max_frame: int):
+    def __init__(
+        self,
+        root: tk.Tk,
+        reports: list[FrameReport],
+        min_frame: int,
+        max_frame: int,
+        gt_edit: bool = False,
+        gt_work_file: str | None = None,
+        gt_output_file: str | None = None,
+        gt_seed: str = "tracks",
+    ):
         self.root = root
         self.reports = reports
         self.min_frame = min_frame
@@ -748,6 +822,18 @@ class MatchViewerApp:
         self.report_by_frame = {r.frame: r for r in reports}
         self.current_frame = min_frame
         self.photo = None
+        self.image_scale = 1.0
+        self.gt_edit = gt_edit
+        self.gt_work_file = gt_work_file
+        self.gt_output_file = gt_output_file
+        self.gt_seed = gt_seed
+        self.gt_by_frame = _load_gt_work_file(gt_work_file)
+        self.selected_gt_index: int | None = None
+        self.drag_mode: str | None = None
+        self.drag_start_image_xy: tuple[float, float] | None = None
+        self.drag_start_bbox: list[float] | None = None
+        self.status_var = tk.StringVar(value="")
+        self.gt_only_view = False
 
         self.root.title("Tracking Match Debug Viewer")
         self.root.geometry("1800x1200")
@@ -762,6 +848,14 @@ class MatchViewerApp:
         self.root.option_add("*Font", default_font)
         self.root.bind("<KeyPress-a>", lambda _e: self.prev_frame())
         self.root.bind("<KeyPress-d>", lambda _e: self.next_frame())
+        self.root.bind("<KeyPress-i>", lambda _e: self.set_selected_gt_id())
+        self.root.bind("<KeyPress-s>", lambda _e: self.save_gt_work())
+        self.root.bind("<KeyPress-e>", lambda _e: self.export_gt())
+        self.root.bind("<KeyPress-g>", lambda _e: self.add_gt_from_detection())
+        self.root.bind("<KeyPress-r>", lambda _e: self.rename_gt_id_global())
+        self.root.bind("<KeyPress-h>", lambda _e: self.toggle_gt_only_view())
+        self.root.bind("<Delete>", lambda _e: self.delete_selected_gt())
+        self.root.bind("<BackSpace>", lambda _e: self.delete_selected_gt())
 
         top = ttk.Frame(root)
         top.pack(fill="x", padx=12, pady=12)
@@ -770,6 +864,23 @@ class MatchViewerApp:
         ttk.Button(top, text="Next >>", command=self.next_frame).pack(side="left", padx=(10, 0))
         ttk.Button(top, text="-10", command=lambda: self.step(-10)).pack(side="left", padx=(20, 0))
         ttk.Button(top, text="+10", command=lambda: self.step(10)).pack(side="left", padx=(10, 0))
+
+        self.gt_toggle_button = ttk.Button(top, text="", command=self.toggle_gt_edit)
+        self.gt_toggle_button.pack(side="left", padx=(20, 0))
+        self.gt_only_button = ttk.Button(top, text="", command=self.toggle_gt_only_view)
+        self.gt_only_button.pack(side="left", padx=(8, 0))
+        self.add_gt_button = ttk.Button(top, text="Add Det (g)", command=self.add_gt_from_detection)
+        self.add_gt_button.pack(side="left", padx=(8, 0))
+        self.set_gt_id_button = ttk.Button(top, text="Set ID (i)", command=self.set_selected_gt_id)
+        self.set_gt_id_button.pack(side="left", padx=(8, 0))
+        self.rename_gt_id_button = ttk.Button(top, text="Rename ID (r)", command=self.rename_gt_id_global)
+        self.rename_gt_id_button.pack(side="left", padx=(8, 0))
+        self.delete_gt_button = ttk.Button(top, text="Delete", command=self.delete_selected_gt)
+        self.delete_gt_button.pack(side="left", padx=(8, 0))
+        self.save_gt_button = ttk.Button(top, text="Save JSON (s)", command=self.save_gt_work)
+        self.save_gt_button.pack(side="left", padx=(8, 0))
+        self.export_gt_button = ttk.Button(top, text="Export GT (e)", command=self.export_gt)
+        self.export_gt_button.pack(side="left", padx=(8, 0))
 
         self.frame_label = ttk.Label(top, text="")
         self.frame_label.pack(side="left", padx=(24, 0))
@@ -791,6 +902,9 @@ class MatchViewerApp:
         )
         self.scale.pack(side="right", fill="x", expand=True, padx=(20, 0))
 
+        self.status_label = ttk.Label(root, textvariable=self.status_var)
+        self.status_label.pack(fill="x", padx=12, pady=(0, 8))
+
         main = ttk.Panedwindow(root, orient="vertical")
         main.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
@@ -799,8 +913,11 @@ class MatchViewerApp:
         main.add(upper, weight=5)
         main.add(lower, weight=3)
 
-        self.image_label = ttk.Label(upper)
-        self.image_label.pack(fill="both", expand=True)
+        self.image_canvas = tk.Canvas(upper, background="black", highlightthickness=0)
+        self.image_canvas.pack(fill="both", expand=True)
+        self.image_canvas.bind("<ButtonPress-1>", self.on_canvas_press)
+        self.image_canvas.bind("<B1-Motion>", self.on_canvas_drag)
+        self.image_canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
 
         info_pane = ttk.Panedwindow(lower, orient="horizontal")
         info_pane.pack(fill="both", expand=True)
@@ -818,6 +935,7 @@ class MatchViewerApp:
         self.matrix_text.pack(fill="both", expand=True)
 
         self.scale.set(self.current_frame)
+        self.update_gt_controls()
         self.render()
 
     def on_scale(self, value):
@@ -849,71 +967,405 @@ class MatchViewerApp:
         if report is None:
             return
         self.frame_label.config(text=f"Frame {report.frame}")
+        if self.gt_edit:
+            self.ensure_gt_frame(report)
         self.render_image(report)
         self.render_text(report)
+
+    def update_gt_controls(self):
+        self.gt_toggle_button.config(
+            text="Exit GT Edit" if self.gt_edit else "Start GT Edit"
+        )
+        state = "normal" if self.gt_edit else "disabled"
+        for button in (
+            self.gt_only_button,
+            self.add_gt_button,
+            self.set_gt_id_button,
+            self.rename_gt_id_button,
+            self.delete_gt_button,
+            self.save_gt_button,
+            self.export_gt_button,
+        ):
+            button.config(state=state)
+        self.gt_only_button.config(
+            text="Show All (h)" if self.gt_only_view else "GT Only (h)"
+        )
+
+    def set_status(self, message: str):
+        self.status_var.set(message)
+
+    def toggle_gt_only_view(self):
+        if not self.gt_edit:
+            return
+        self.gt_only_view = not self.gt_only_view
+        self.update_gt_controls()
+        self.render()
+
+    def toggle_gt_edit(self):
+        self.gt_edit = not self.gt_edit
+        if self.gt_edit and not self.gt_by_frame and self.gt_work_file:
+            self.gt_by_frame = _load_gt_work_file(self.gt_work_file)
+        self.update_gt_controls()
+        self.render()
+
+    def ensure_gt_frame(self, report: FrameReport):
+        if report.frame in self.gt_by_frame:
+            return
+        if self.gt_seed == "tracks":
+            self.gt_by_frame[report.frame] = [
+                {
+                    "gt_id": int(tr["track_id"]),
+                    "bbox_tlwh": [float(x) for x in tr["bbox_tlwh"]],
+                }
+                for tr in report.tracks
+            ]
+        elif self.gt_seed == "detections":
+            self.gt_by_frame[report.frame] = [
+                {
+                    "gt_id": int(det["index"]) + 1,
+                    "bbox_tlwh": [float(x) for x in det["bbox_tlwh"]],
+                }
+                for det in report.detections
+            ]
+        else:
+            self.gt_by_frame[report.frame] = []
+
+    def ensure_all_gt_frames(self):
+        for report in self.reports:
+            self.ensure_gt_frame(report)
+
+    def image_to_canvas_xy(self, x: float, y: float) -> tuple[float, float]:
+        return x * self.image_scale, y * self.image_scale
+
+    def canvas_to_image_xy(self, x: float, y: float) -> tuple[float, float]:
+        scale = max(self.image_scale, 1e-12)
+        return x / scale, y / scale
+
+    def _selected_bbox_hit(self, img_x: float, img_y: float) -> tuple[int | None, str | None]:
+        boxes = self.gt_by_frame.get(self.current_frame, [])
+        best_idx = None
+        best_mode = None
+        best_dist = float("inf")
+        corner_radius = 12.0 / max(self.image_scale, 1e-12)
+        for idx, box in enumerate(boxes):
+            x, y, w, h = box["bbox_tlwh"]
+            corners = {
+                "nw": (x, y),
+                "ne": (x + w, y),
+                "sw": (x, y + h),
+                "se": (x + w, y + h),
+            }
+            for mode, (cx, cy) in corners.items():
+                dist = ((img_x - cx) ** 2 + (img_y - cy) ** 2) ** 0.5
+                if dist < best_dist and dist <= corner_radius:
+                    best_idx = idx
+                    best_mode = mode
+                    best_dist = dist
+            if best_idx is None and x <= img_x <= x + w and y <= img_y <= y + h:
+                best_idx = idx
+                best_mode = "move"
+        return best_idx, best_mode
+
+    def on_canvas_press(self, event):
+        if not self.gt_edit:
+            return
+        img_x, img_y = self.canvas_to_image_xy(event.x, event.y)
+        idx, mode = self._selected_bbox_hit(img_x, img_y)
+        self.selected_gt_index = idx
+        self.drag_mode = mode
+        self.drag_start_image_xy = (img_x, img_y)
+        boxes = self.gt_by_frame.get(self.current_frame, [])
+        self.drag_start_bbox = (
+            list(boxes[idx]["bbox_tlwh"]) if idx is not None and idx < len(boxes) else None
+        )
+        self.render()
+
+    def on_canvas_drag(self, event):
+        if not self.gt_edit:
+            return
+        if self.selected_gt_index is None or self.drag_mode is None:
+            return
+        boxes = self.gt_by_frame.get(self.current_frame, [])
+        if self.selected_gt_index >= len(boxes) or self.drag_start_bbox is None:
+            return
+        start_x, start_y = self.drag_start_image_xy or (0.0, 0.0)
+        img_x, img_y = self.canvas_to_image_xy(event.x, event.y)
+        dx, dy = img_x - start_x, img_y - start_y
+        x, y, w, h = self.drag_start_bbox
+        x2, y2 = x + w, y + h
+        if self.drag_mode == "move":
+            new_box = [x + dx, y + dy, w, h]
+        else:
+            if "n" in self.drag_mode:
+                y = min(y + dy, y2 - 2.0)
+            if "s" in self.drag_mode:
+                y2 = max(y2 + dy, y + 2.0)
+            if "w" in self.drag_mode:
+                x = min(x + dx, x2 - 2.0)
+            if "e" in self.drag_mode:
+                x2 = max(x2 + dx, x + 2.0)
+            new_box = [x, y, x2 - x, y2 - y]
+        boxes[self.selected_gt_index]["bbox_tlwh"] = [float(v) for v in new_box]
+        self.render()
+
+    def on_canvas_release(self, _event):
+        if not self.gt_edit:
+            return
+        self.drag_mode = None
+        self.drag_start_image_xy = None
+        self.drag_start_bbox = None
+
+    def set_selected_gt_id(self):
+        if not self.gt_edit:
+            return
+        boxes = self.gt_by_frame.get(self.current_frame, [])
+        if self.selected_gt_index is None or self.selected_gt_index >= len(boxes):
+            self.set_status("Select a GT box first.")
+            return
+        current_id = int(boxes[self.selected_gt_index]["gt_id"])
+        new_id = simpledialog.askinteger("GT ID", "Set GT ID:", initialvalue=current_id)
+        if new_id is None:
+            return
+        boxes[self.selected_gt_index]["gt_id"] = int(new_id)
+        self.render()
+
+    def rename_gt_id_global(self):
+        if not self.gt_edit:
+            return
+        self.ensure_all_gt_frames()
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Rename GT ID")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        old_var = tk.StringVar()
+        new_var = tk.StringVar()
+        start_var = tk.StringVar(value=str(self.current_frame))
+        end_var = tk.StringVar(value=str(self.current_frame))
+
+        ttk.Label(dialog, text="GT ID to replace").grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 4))
+        old_entry = ttk.Entry(dialog, textvariable=old_var, width=18)
+        old_entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12)
+
+        ttk.Label(dialog, text="Replace with GT ID").grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 4))
+        new_entry = ttk.Entry(dialog, textvariable=new_var, width=18)
+        new_entry.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12)
+
+        ttk.Label(dialog, text="Start frame").grid(row=4, column=0, sticky="w", padx=12, pady=(12, 4))
+        ttk.Label(dialog, text="End frame").grid(row=4, column=1, sticky="w", padx=12, pady=(12, 4))
+        start_entry = ttk.Entry(dialog, textvariable=start_var, width=12)
+        end_entry = ttk.Entry(dialog, textvariable=end_var, width=12)
+        start_entry.grid(row=5, column=0, sticky="ew", padx=12)
+        end_entry.grid(row=5, column=1, sticky="ew", padx=12)
+
+        def _parse_ids():
+            try:
+                old_id = int(old_var.get().strip())
+                new_id = int(new_var.get().strip())
+            except ValueError:
+                self.set_status("GT IDs must be integers.")
+                return None
+            return old_id, new_id
+
+        def _apply(frame_start: int, frame_end: int):
+            parsed = _parse_ids()
+            if parsed is None:
+                return
+            old_id, new_id = parsed
+            if frame_start > frame_end:
+                frame_start, frame_end = frame_end, frame_start
+            changed = 0
+            for frame, boxes in self.gt_by_frame.items():
+                if frame < frame_start or frame > frame_end:
+                    continue
+                for box in boxes:
+                    if int(box["gt_id"]) == old_id:
+                        box["gt_id"] = new_id
+                        changed += 1
+            self.set_status(
+                f"Renamed {changed} boxes: GT{old_id} -> GT{new_id}\n"
+                f"Frames: {frame_start}-{frame_end}",
+            )
+            dialog.destroy()
+            self.render()
+
+        def _apply_range():
+            try:
+                frame_start = int(start_var.get().strip())
+                frame_end = int(end_var.get().strip())
+            except ValueError:
+                self.set_status("Start and end frames must be integers.")
+                return
+            _apply(frame_start, frame_end)
+
+        def _apply_all():
+            _apply(self.min_frame, self.max_frame)
+
+        button_row = ttk.Frame(dialog)
+        button_row.grid(row=6, column=0, columnspan=2, sticky="ew", padx=12, pady=12)
+        ttk.Button(button_row, text="Apply Range", command=_apply_range).pack(side="left")
+        ttk.Button(button_row, text="Replace All", command=_apply_all).pack(side="left", padx=(10, 0))
+        ttk.Button(button_row, text="Cancel", command=dialog.destroy).pack(side="right")
+
+        old_entry.focus_set()
+
+    def add_gt_from_detection(self):
+        if not self.gt_edit:
+            return
+        report = self.report_by_frame.get(self.current_frame)
+        if report is None:
+            return
+        if not report.detections:
+            self.set_status("No detections on this frame.")
+            return
+        det_idx = simpledialog.askinteger("Detection", "Detection index to add, e.g. 0 for D0:")
+        if det_idx is None:
+            return
+        det_by_idx = {int(det["index"]): det for det in report.detections}
+        det = det_by_idx.get(int(det_idx))
+        if det is None:
+            self.set_status(f"D{det_idx} does not exist on this frame.")
+            return
+        gt_id = simpledialog.askinteger("GT ID", "GT ID for this box:", initialvalue=int(det_idx) + 1)
+        if gt_id is None:
+            return
+        boxes = self.gt_by_frame.setdefault(self.current_frame, [])
+        boxes.append(
+            {
+                "gt_id": int(gt_id),
+                "bbox_tlwh": [float(x) for x in det["bbox_tlwh"]],
+            }
+        )
+        self.selected_gt_index = len(boxes) - 1
+        self.render()
+
+    def delete_selected_gt(self):
+        if not self.gt_edit:
+            return
+        boxes = self.gt_by_frame.get(self.current_frame, [])
+        if self.selected_gt_index is None or self.selected_gt_index >= len(boxes):
+            return
+        del boxes[self.selected_gt_index]
+        self.selected_gt_index = None
+        self.render()
+
+    def save_gt_work(self):
+        if not self.gt_edit:
+            return
+        if not self.gt_work_file:
+            self.set_status("No --gt_work_file was provided.")
+            return
+        self.ensure_all_gt_frames()
+        _save_gt_work_file(self.gt_work_file, self.gt_by_frame)
+        self.set_status(f"Saved JSON: {self.gt_work_file}")
+
+    def export_gt(self):
+        if not self.gt_edit:
+            return
+        if not self.gt_output_file:
+            self.set_status("No --gt_output_file was provided.")
+            return
+        self.ensure_all_gt_frames()
+        _export_gt_mot(self.gt_output_file, self.gt_by_frame)
+        self.set_status(f"Exported MOT GT: {self.gt_output_file}")
+
+    def draw_gt_overlay(self):
+        boxes = self.gt_by_frame.get(self.current_frame, [])
+        for idx, box in enumerate(boxes):
+            x, y, w, h = box["bbox_tlwh"]
+            x1, y1 = self.image_to_canvas_xy(x, y)
+            x2, y2 = self.image_to_canvas_xy(x + w, y + h)
+            color = "#00ffff" if idx == self.selected_gt_index else "#ffff00"
+            width = 4 if idx == self.selected_gt_index else 2
+            self.image_canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=width)
+            self.image_canvas.create_text(
+                x1 + 4,
+                max(12, y1 - 12),
+                text=f"GT{int(box['gt_id'])}",
+                fill=color,
+                anchor="w",
+                font=("TkDefaultFont", 16, "bold"),
+            )
+            handle_r = 5
+            for cx, cy in ((x1, y1), (x2, y1), (x1, y2), (x2, y2)):
+                self.image_canvas.create_rectangle(
+                    cx - handle_r,
+                    cy - handle_r,
+                    cx + handle_r,
+                    cy + handle_r,
+                    outline=color,
+                    fill=color,
+                )
 
     def render_image(self, report: FrameReport):
         image = cv2.imread(report.image_path, cv2.IMREAD_COLOR)
         if image is None:
             return
 
-        for det in report.detections:
-            x, y, w, h = [int(v) for v in det["bbox_tlwh"]]
-            cv2.rectangle(image, (x, y), (x + w, y + h), (255, 255, 255), 2)
-            cv2.putText(
-                image,
-                f"D{det['index']} {det['confidence']:.2f}",
-                (x, max(15, y - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
-                2,
-            )
-
-        for tr in report.tracks:
-            x, y, w, h = [int(v) for v in tr["bbox_tlwh"]]
-            color = create_unique_color_uchar(tr["track_id"])
-            cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
-            match_conf = tr.get("match_confidence")
-            if match_conf is None:
-                label = f"T{tr['track_id']}"
-            else:
-                label = f"T{tr['track_id']} {match_conf:.2f}"
-            (text_w, text_h), baseline = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
-            )
-            text_x = min(max(0, x + w - text_w), max(0, image.shape[1] - text_w - 1))
-            text_y = max(text_h + 2, y - 6)
-            cv2.putText(
-                image,
-                label,
-                (text_x, text_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                color,
-                2,
-            )
-            if tr["track_id"] in report.ambiguous_track_ids:
+        if not (self.gt_edit and self.gt_only_view):
+            for det in report.detections:
+                x, y, w, h = [int(v) for v in det["bbox_tlwh"]]
+                cv2.rectangle(image, (x, y), (x + w, y + h), (255, 255, 255), 2)
                 cv2.putText(
                     image,
-                    f"T{tr['track_id']} AMBIGUOUS",
-                    (x, max(30, y - 12)),
+                    f"D{det['index']} {det['confidence']:.2f}",
+                    (x, max(15, y - 5)),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    (255, 0, 0),
+                    0.55,
+                    (255, 255, 255),
                     2,
                 )
+
+            for tr in report.tracks:
+                x, y, w, h = [int(v) for v in tr["bbox_tlwh"]]
+                color = create_unique_color_uchar(tr["track_id"])
+                cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
+                match_conf = tr.get("match_confidence")
+                if match_conf is None:
+                    label = f"T{tr['track_id']}"
+                else:
+                    label = f"T{tr['track_id']} {match_conf:.2f}"
+                (text_w, text_h), baseline = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
+                )
+                text_x = min(max(0, x + w - text_w), max(0, image.shape[1] - text_w - 1))
+                text_y = max(text_h + 2, y - 6)
+                cv2.putText(
+                    image,
+                    label,
+                    (text_x, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    color,
+                    2,
+                )
+                if tr["track_id"] in report.ambiguous_track_ids:
+                    cv2.putText(
+                        image,
+                        f"T{tr['track_id']} AMBIGUOUS",
+                        (x, max(30, y - 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.65,
+                        (255, 0, 0),
+                        2,
+                    )
 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         max_w, max_h = 2400,1120
         h, w = image.shape[:2]
         scale = min(max_w / w, max_h / h)
+        self.image_scale = scale
         new_w = max(1, int(w * scale))
         new_h = max(1, int(h * scale))
         image = cv2.resize(image, (new_w, new_h))
         pil_image = Image.fromarray(image)
         self.photo = ImageTk.PhotoImage(pil_image)
-        self.image_label.configure(image=self.photo)
+        self.image_canvas.delete("all")
+        self.image_canvas.configure(width=new_w, height=new_h)
+        self.image_canvas.create_image(0, 0, anchor="nw", image=self.photo)
+        if self.gt_edit:
+            self.draw_gt_overlay()
 
     def render_text(self, report: FrameReport):
         self.summary_text.delete("1.0", tk.END)
@@ -955,6 +1407,19 @@ class MatchViewerApp:
             tk.END,
             f"Unmatched detections: {report.unmatched_detection_indices or 'none'}\n",
         )
+
+        if self.gt_edit:
+            self.summary_text.insert(tk.END, "\nGT edit boxes\n")
+            gt_boxes = self.gt_by_frame.get(report.frame, [])
+            if gt_boxes:
+                for idx, box in enumerate(gt_boxes):
+                    selected = " *" if idx == self.selected_gt_index else ""
+                    self.summary_text.insert(
+                        tk.END,
+                        f"  #{idx}{selected}: GT{int(box['gt_id'])}, bbox={_format_bbox(box['bbox_tlwh'])}\n",
+                    )
+            else:
+                self.summary_text.insert(tk.END, "  none\n")
 
         if report.ambiguous_track_ids:
             self.summary_text.insert(tk.END, "\nAmbiguous split warning\n", "alert")
@@ -1074,6 +1539,15 @@ def parse_args():
     parser.add_argument("--nms_max_overlap", type=float, default=None)
     parser.add_argument("--max_cosine_distance", type=float, default=None)
     parser.add_argument("--nn_budget", type=int, default=None)
+    parser.add_argument("--gt_edit", action="store_true", help="Enable interactive GT editing overlay.")
+    parser.add_argument("--gt_work_file", default=None, help="JSON file used to save/load editable GT boxes. Defaults to <sequence_dir>/gt/gt_work.json.")
+    parser.add_argument("--gt_output_file", default=None, help="MOT-format gt.txt output path for GT edit mode. Defaults to <sequence_dir>/gt/gt.txt.")
+    parser.add_argument(
+        "--gt_seed",
+        choices=["tracks", "detections", "none"],
+        default="tracks",
+        help="How to initialize frames that are not present in --gt_work_file.",
+    )
     return parser.parse_args()
 
 
@@ -1106,6 +1580,8 @@ def main():
     from opts import opt
 
     print("Preparing frame reports. This may take a moment...")
+    gt_work_file = args.gt_work_file or _default_gt_work_file(args.sequence_dir)
+    gt_output_file = args.gt_output_file or _default_gt_output_file(args.sequence_dir)
     min_confidence = opt.min_confidence if args.min_confidence is None else args.min_confidence
     min_detection_height = (
         opt.min_detection_height if args.min_detection_height is None else args.min_detection_height
@@ -1147,7 +1623,16 @@ def main():
         )
     print(f"Loaded {len(reports)} frames.")
     root = tk.Tk()
-    MatchViewerApp(root, reports, min_frame, max_frame)
+    MatchViewerApp(
+        root,
+        reports,
+        min_frame,
+        max_frame,
+        gt_edit=args.gt_edit,
+        gt_work_file=gt_work_file,
+        gt_output_file=gt_output_file,
+        gt_seed=args.gt_seed,
+    )
     root.mainloop()
 
 
