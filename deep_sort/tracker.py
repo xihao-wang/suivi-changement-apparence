@@ -36,7 +36,7 @@ class Tracker:
 
     """
 
-    def __init__(self, metric, max_iou_distance=0.7, max_age=30, n_init=10,
+    def __init__(self, metric, max_iou_distance=0.7, max_age=100, n_init=10,
                  temporal_model=None, temporal_alpha=1.0,
                  fuse_temporal_model=False, temporal_max_correction=0.02,
                  temporal_min_scale=0.02):
@@ -225,7 +225,7 @@ class Tracker:
             beta = gamma * effective_scale / max(learned_scale, eps)
             correction = beta * learned_delta
             correction = np.clip(correction, -max_correction, max_correction)
-            fused[row_idx, valid_mask] = np.maximum(base_row + correction, 0.0)
+            fused[row_idx, valid_mask] = base_row + correction
 
         # Row-wise correction handles "one track chooses among detections".
         # Column-wise correction handles "multiple tracks compete for one detection".
@@ -244,7 +244,13 @@ class Tracker:
             beta = gamma * effective_scale / max(learned_scale, eps)
             correction = beta * learned_delta
             correction = np.clip(correction, -max_correction, max_correction)
-            fused[valid_mask, col_idx] = np.maximum(fused[valid_mask, col_idx] + correction, 0.0)
+            fused[valid_mask, col_idx] = fused[valid_mask, col_idx] + correction
+
+        valid_mask = fused < big_cost
+        if np.any(valid_mask):
+            min_value = float(np.min(fused[valid_mask]))
+            if min_value < 0.0:
+                fused[valid_mask] = fused[valid_mask] - min_value
         return fused
 
     def _gate_cost_matrix_with_temporal_rescue(
