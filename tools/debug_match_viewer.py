@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import colorsys
+import copy
 import json
 import sys
 from dataclasses import dataclass
@@ -834,6 +835,9 @@ class MatchViewerApp:
         self.drag_start_bbox: list[float] | None = None
         self.status_var = tk.StringVar(value="")
         self.gt_only_view = False
+        self.undo_stack: list[dict[int, list[dict[str, Any]]]] = []
+        self.max_undo_steps = 50
+        self.drag_changed = False
 
         self.root.title("Tracking Match Debug Viewer")
         self.root.geometry("1800x1200")
@@ -854,6 +858,7 @@ class MatchViewerApp:
         self.root.bind("<KeyPress-g>", lambda _e: self.add_gt_from_detection())
         self.root.bind("<KeyPress-r>", lambda _e: self.rename_gt_id_global())
         self.root.bind("<KeyPress-h>", lambda _e: self.toggle_gt_only_view())
+        self.root.bind("<Control-z>", lambda _e: self.undo_gt_edit())
         self.root.bind("<Delete>", lambda _e: self.delete_selected_gt())
         self.root.bind("<BackSpace>", lambda _e: self.delete_selected_gt())
 
@@ -877,6 +882,8 @@ class MatchViewerApp:
         self.rename_gt_id_button.pack(side="left", padx=(8, 0))
         self.delete_gt_button = ttk.Button(top, text="Delete", command=self.delete_selected_gt)
         self.delete_gt_button.pack(side="left", padx=(8, 0))
+        self.undo_gt_button = ttk.Button(top, text="Undo (Ctrl+Z)", command=self.undo_gt_edit)
+        self.undo_gt_button.pack(side="left", padx=(8, 0))
         self.save_gt_button = ttk.Button(top, text="Save JSON (s)", command=self.save_gt_work)
         self.save_gt_button.pack(side="left", padx=(8, 0))
         self.export_gt_button = ttk.Button(top, text="Export GT (e)", command=self.export_gt)
@@ -983,6 +990,7 @@ class MatchViewerApp:
             self.set_gt_id_button,
             self.rename_gt_id_button,
             self.delete_gt_button,
+            self.undo_gt_button,
             self.save_gt_button,
             self.export_gt_button,
         ):
@@ -993,6 +1001,29 @@ class MatchViewerApp:
 
     def set_status(self, message: str):
         self.status_var.set(message)
+
+    def _snapshot_gt_state(self) -> dict[int, list[dict[str, Any]]]:
+        return copy.deepcopy(self.gt_by_frame)
+
+    def push_undo_state(self):
+        self.undo_stack.append(self._snapshot_gt_state())
+        if len(self.undo_stack) > self.max_undo_steps:
+            self.undo_stack = self.undo_stack[-self.max_undo_steps:]
+
+    def undo_gt_edit(self):
+        if not self.gt_edit:
+            return
+        if not self.undo_stack:
+            self.set_status("Nothing to undo.")
+            return
+        self.gt_by_frame = self.undo_stack.pop()
+        self.selected_gt_index = None
+        self.drag_mode = None
+        self.drag_start_image_xy = None
+        self.drag_start_bbox = None
+        self.drag_changed = False
+        self.set_status("Undid last GT edit.")
+        self.render()
 
     def toggle_gt_only_view(self):
         if not self.gt_edit:
@@ -1074,6 +1105,7 @@ class MatchViewerApp:
         self.selected_gt_index = idx
         self.drag_mode = mode
         self.drag_start_image_xy = (img_x, img_y)
+        self.drag_changed = False
         boxes = self.gt_by_frame.get(self.current_frame, [])
         self.drag_start_bbox = (
             list(boxes[idx]["bbox_tlwh"]) if idx is not None and idx < len(boxes) else None
@@ -1088,6 +1120,9 @@ class MatchViewerApp:
         boxes = self.gt_by_frame.get(self.current_frame, [])
         if self.selected_gt_index >= len(boxes) or self.drag_start_bbox is None:
             return
+        if not self.drag_changed:
+            self.push_undo_state()
+            self.drag_changed = True
         start_x, start_y = self.drag_start_image_xy or (0.0, 0.0)
         img_x, img_y = self.canvas_to_image_xy(event.x, event.y)
         dx, dy = img_x - start_x, img_y - start_y
@@ -1114,6 +1149,7 @@ class MatchViewerApp:
         self.drag_mode = None
         self.drag_start_image_xy = None
         self.drag_start_bbox = None
+        self.drag_changed = False
 
     def set_selected_gt_id(self):
         if not self.gt_edit:
@@ -1126,7 +1162,11 @@ class MatchViewerApp:
         new_id = simpledialog.askinteger("GT ID", "Set GT ID:", initialvalue=current_id)
         if new_id is None:
             return
+        if int(new_id) == current_id:
+            return
+        self.push_undo_state()
         boxes[self.selected_gt_index]["gt_id"] = int(new_id)
+        self.set_status(f"Set GT ID: GT{current_id} -> GT{int(new_id)}")
         self.render()
 
     def rename_gt_id_global(self):
@@ -1176,6 +1216,7 @@ class MatchViewerApp:
             if frame_start > frame_end:
                 frame_start, frame_end = frame_end, frame_start
             changed = 0
+            self.push_undo_state()
             for frame, boxes in self.gt_by_frame.items():
                 if frame < frame_start or frame > frame_end:
                     continue
@@ -1183,6 +1224,8 @@ class MatchViewerApp:
                     if int(box["gt_id"]) == old_id:
                         box["gt_id"] = new_id
                         changed += 1
+            if changed == 0:
+                self.undo_stack.pop()
             self.set_status(
                 f"Renamed {changed} boxes: GT{old_id} -> GT{new_id}\n"
                 f"Frames: {frame_start}-{frame_end}",
@@ -1230,6 +1273,7 @@ class MatchViewerApp:
         gt_id = simpledialog.askinteger("GT ID", "GT ID for this box:", initialvalue=int(det_idx) + 1)
         if gt_id is None:
             return
+        self.push_undo_state()
         boxes = self.gt_by_frame.setdefault(self.current_frame, [])
         boxes.append(
             {
@@ -1246,8 +1290,10 @@ class MatchViewerApp:
         boxes = self.gt_by_frame.get(self.current_frame, [])
         if self.selected_gt_index is None or self.selected_gt_index >= len(boxes):
             return
+        self.push_undo_state()
         del boxes[self.selected_gt_index]
         self.selected_gt_index = None
+        self.set_status("Deleted selected GT box.")
         self.render()
 
     def save_gt_work(self):
