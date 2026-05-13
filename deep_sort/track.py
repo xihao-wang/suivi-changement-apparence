@@ -330,6 +330,13 @@ class Track:
         elif self.time_since_update > self._max_age:
             self.state = TrackState.Deleted
 
+    def reactivate(self, detection):
+        """Bring an archived confirmed track back with a fresh Kalman state."""
+        self.mean, self.covariance = self.kf.initiate(detection.to_xyah())
+        self.state = TrackState.Confirmed
+        self.time_since_update = 0
+        self.update(detection)
+
     def is_tentative(self):
         """Returns True if this track is tentative (unconfirmed).
         """

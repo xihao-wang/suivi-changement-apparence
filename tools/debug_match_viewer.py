@@ -55,6 +55,9 @@ class FrameReport:
     matches: list[dict[str, int]]
     unmatched_track_ids: list[int]
     unmatched_detection_indices: list[int]
+    stored_track_ids: list[int]
+    stale_track_ids: list[int]
+    inactive_track_ids: list[int]
     ambiguous_track_ids: list[int]
     ambiguous_info: dict[int, dict[str, Any]]
 
@@ -301,6 +304,9 @@ def _build_replay_reports(
                     "bbox_tlwh": list(row["bbox_tlwh"]),
                 }
             )
+        current_track_ids = sorted(int(track["track_id"]) for track in tracks)
+        stored_track_ids = list(current_track_ids)
+        inactive_track_ids = []
 
         matches = []
         unmatched_detection_indices = set(range(len(detections)))
@@ -330,6 +336,18 @@ def _build_replay_reports(
         expected_track_ids = [int(tr["track_id"]) for tr in tracks]
         expected_detection_indices = list(range(len(detections)))
         precomputed = precomputed_scores_by_frame.get(frame_idx, {})
+        if "stored_track_ids" in precomputed:
+            stored_track_ids = [int(track_id) for track_id in precomputed["stored_track_ids"]]
+        elif "matrix_track_ids" in precomputed:
+            stored_track_ids = [int(track_id) for track_id in precomputed["matrix_track_ids"]]
+        stale_track_ids = [
+            track_id for track_id in stored_track_ids
+            if track_id not in current_track_ids
+        ]
+        if "stale_track_ids" in precomputed:
+            stale_track_ids = [int(track_id) for track_id in precomputed["stale_track_ids"]]
+        if "inactive_track_ids" in precomputed:
+            inactive_track_ids = [int(track_id) for track_id in precomputed["inactive_track_ids"]]
 
         appearance_cost = _align_precomputed_matrix(
             precomputed,
@@ -387,6 +405,9 @@ def _build_replay_reports(
             matches=matches,
             unmatched_track_ids=unmatched_track_ids,
             unmatched_detection_indices=sorted(unmatched_detection_indices),
+            stored_track_ids=stored_track_ids,
+            stale_track_ids=stale_track_ids,
+            inactive_track_ids=inactive_track_ids,
             ambiguous_track_ids=[],
             ambiguous_info={},
         )
@@ -481,6 +502,7 @@ def build_reports(
             tracker.camera_update(Path(sequence_dir).name, frame_idx)
 
         tracker.predict()
+        tracker._prune_inactive_tracks()
 
         confirmed_track_indices = [
             i for i, t in enumerate(tracker.tracks) if t.is_confirmed()
@@ -567,6 +589,17 @@ def build_reports(
             tracker.clear_temporal_cost_override()
 
         matches, unmatched_tracks, unmatched_detections = tracker._match(detections)
+        stored_track_ids = sorted(
+            {int(track.track_id) for track in tracker.tracks}
+            | {int(track.track_id) for track in getattr(tracker, "inactive_tracks", [])}
+        )
+        stale_track_ids = sorted(
+            int(track.track_id) for track in tracker.tracks
+            if track.is_confirmed() and track.time_since_update > 1
+        )
+        inactive_track_ids = sorted(
+            int(track.track_id) for track in getattr(tracker, "inactive_tracks", [])
+        )
 
         report = FrameReport(
             frame=frame_idx,
@@ -616,6 +649,9 @@ def build_reports(
             ],
             unmatched_track_ids=[tracker.tracks[idx].track_id for idx in unmatched_tracks],
             unmatched_detection_indices=list(unmatched_detections),
+            stored_track_ids=stored_track_ids,
+            stale_track_ids=stale_track_ids,
+            inactive_track_ids=inactive_track_ids,
             ambiguous_track_ids=list(tracker.last_ambiguous_tracks),
             ambiguous_info=dict(tracker.last_ambiguous_info),
         )
@@ -624,10 +660,17 @@ def build_reports(
         for track_idx, detection_idx in matches:
             tracker.tracks[track_idx].update(detections[detection_idx])
         for track_idx in unmatched_tracks:
-            tracker.tracks[track_idx].mark_missed()
+            track = tracker.tracks[track_idx]
+            was_confirmed = track.is_confirmed()
+            track.mark_missed()
+            if was_confirmed and track.is_deleted():
+                tracker._archive_track(track)
+        tracker.tracks = [t for t in tracker.tracks if not t.is_deleted()]
+        unmatched_detections = tracker._reactivate_inactive_tracks(
+            detections, unmatched_detections
+        )
         for detection_idx in unmatched_detections:
             tracker._initiate_track(detections[detection_idx])
-        tracker.tracks = [t for t in tracker.tracks if not t.is_deleted()]
 
         active_targets = [t.track_id for t in tracker.tracks if t.is_confirmed()]
         feat_list, target_list = [], []
@@ -1355,7 +1398,7 @@ class MatchViewerApp:
                 cv2.rectangle(image, (x, y), (x + w, y + h), (255, 255, 255), 2)
                 cv2.putText(
                     image,
-                    f"D{det['index']} {det['confidence']:.2f}",
+                    f"D{det['index']}",
                     (x, max(15, y - 5)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
@@ -1420,12 +1463,21 @@ class MatchViewerApp:
         self.summary_text.insert(tk.END, f"Frame: {report.frame}\n")
         self.summary_text.insert(tk.END, f"Detections: {len(report.detections)}\n")
         self.summary_text.insert(tk.END, f"Tracks: {len(report.tracks)}\n\n")
+        self.summary_text.insert(
+            tk.END, f"Stored tracks: {report.stored_track_ids or 'none'}\n"
+        )
+        self.summary_text.insert(
+            tk.END, f"Stale tracks: {report.stale_track_ids or 'none'}\n"
+        )
+        self.summary_text.insert(
+            tk.END, f"Inactive tracks: {report.inactive_track_ids or 'none'}\n\n"
+        )
 
         self.summary_text.insert(tk.END, "Detections\n")
         for det in report.detections:
             self.summary_text.insert(
                 tk.END,
-                f"  D{det['index']}: conf={det['confidence']:.3f}, bbox={_format_bbox(det['bbox_tlwh'])}\n",
+                f"  D{det['index']}: bbox={_format_bbox(det['bbox_tlwh'])}\n",
             )
 
         self.summary_text.insert(tk.END, "\nTracks\n")
@@ -1570,6 +1622,7 @@ def parse_args():
     parser.add_argument("--memory_aware", action="store_true", help="Enable memory-aware matching")
     parser.add_argument("--topk", action="store_true", help="Enable top-k matching")
     parser.add_argument("--full", action="store_true", help="Enable full modified pipeline")
+    parser.add_argument("--inactive_reactivation", action="store_true", help="Enable inactive track reactivation")
     parser.add_argument("--learned_temporal", action="store_true", help="Show learned temporal score matrix using TemporalAttentionScorer")
     parser.add_argument("--fuse_learned_temporal", action="store_true", help="Use learned temporal score in the online tracker association.")
     parser.add_argument("--temporal_model_ckpt", type=str, default=None, help="Optional checkpoint path for the learned temporal scorer")
@@ -1622,6 +1675,8 @@ def main():
         opt_argv.append("--topk")
     if args.full:
         opt_argv.append("--full")
+    if args.inactive_reactivation:
+        opt_argv.append("--inactive_reactivation")
     sys.argv = opt_argv
     from opts import opt
 

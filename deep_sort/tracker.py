@@ -51,6 +51,7 @@ class Tracker:
         self.temporal_min_scale = float(temporal_min_scale)
 
         self.tracks = []
+        self.inactive_tracks = []
         self._next_id = 1
         self.last_ambiguous_tracks = []
         self.last_ambiguous_info = {}
@@ -66,6 +67,150 @@ class Tracker:
 
     def clear_temporal_cost_override(self):
         self.temporal_cost_override = None
+
+    @staticmethod
+    def _cosine_distance_to_bank(feature, memory_bank):
+        if len(memory_bank) == 0:
+            return None
+        feature = np.asarray(feature, dtype=np.float32)
+        feature_norm = np.linalg.norm(feature)
+        if feature_norm < 1e-12:
+            return None
+        feature = feature / feature_norm
+
+        memory = np.asarray(memory_bank, dtype=np.float32)
+        memory_norm = np.linalg.norm(memory, axis=1, keepdims=True)
+        valid = memory_norm.reshape(-1) > 1e-12
+        if not np.any(valid):
+            return None
+        memory = memory[valid] / memory_norm[valid]
+        distances = 1.0 - np.dot(memory, feature)
+        if opt.enable_topk_matching:
+            k = min(opt.k, len(distances))
+            return float(np.mean(np.sort(distances)[:k]))
+        return float(np.min(distances))
+
+    def _inactive_reactivation_distance(self, track, detection):
+        feature = np.asarray(detection.feature, dtype=np.float32)
+        distances = []
+        d_short = self._cosine_distance_to_bank(feature, getattr(track, "short_memory", []))
+        d_long = self._cosine_distance_to_bank(feature, getattr(track, "long_memory", []))
+        if d_short is not None and d_long is not None:
+            distances.append(
+                opt.short_distance_weight * d_short
+                + (1.0 - opt.short_distance_weight) * d_long
+            )
+        elif d_short is not None:
+            distances.append(d_short)
+        elif d_long is not None:
+            distances.append(d_long)
+
+        for ref in (
+            getattr(track, "prototype", None),
+            getattr(track, "prot_short", None),
+            getattr(track, "prot_long", None),
+        ):
+            if ref is not None:
+                d_ref = self._cosine_distance_to_bank(feature, [ref])
+                if d_ref is not None:
+                    distances.append(d_ref)
+
+        if not distances:
+            return 1.0
+        return float(min(distances))
+
+    def _archive_track(self, track):
+        if not opt.enable_inactive_reactivation:
+            return
+        if track.hits < self.n_init:
+            return
+        self.inactive_tracks = [
+            t for t in self.inactive_tracks if t.track_id != track.track_id
+        ]
+        track.inactive_age = 0
+        self.inactive_tracks.append(track)
+        max_tracks = max(0, int(opt.inactive_max_tracks))
+        if max_tracks > 0 and len(self.inactive_tracks) > max_tracks:
+            self.inactive_tracks = self.inactive_tracks[-max_tracks:]
+
+    def _prune_inactive_tracks(self):
+        if not opt.enable_inactive_reactivation:
+            self.inactive_tracks = []
+            return
+        max_age = max(0, int(opt.inactive_max_age))
+        if max_age <= 0:
+            self.inactive_tracks = []
+            return
+        kept = []
+        active_ids = {track.track_id for track in self.tracks}
+        for track in self.inactive_tracks:
+            track.inactive_age = getattr(track, "inactive_age", 0) + 1
+            if track.track_id in active_ids:
+                continue
+            if track.inactive_age <= max_age:
+                kept.append(track)
+        self.inactive_tracks = kept
+
+    def _reactivate_inactive_tracks(self, detections, unmatched_detections):
+        if not opt.enable_inactive_reactivation:
+            return unmatched_detections
+        if len(self.inactive_tracks) == 0 or len(unmatched_detections) == 0:
+            return unmatched_detections
+
+        cost_matrix = np.zeros(
+            (len(self.inactive_tracks), len(unmatched_detections)),
+            dtype=np.float32,
+        )
+        for row, track in enumerate(self.inactive_tracks):
+            for col, detection_idx in enumerate(unmatched_detections):
+                cost_matrix[row, col] = self._inactive_reactivation_distance(
+                    track, detections[detection_idx]
+                )
+
+        threshold = float(opt.inactive_reactivation_threshold)
+        margin = float(opt.inactive_reactivation_margin)
+        assignment_cost = cost_matrix.copy()
+        assignment_cost[assignment_cost > threshold] = threshold + 1e-5
+        indices = linear_assignment.linear_assignment(assignment_cost)
+
+        reactivated_rows = set()
+        reactivated_detections = set()
+        for row, col in indices:
+            distance = float(cost_matrix[row, col])
+            if distance > threshold:
+                continue
+
+            det_alternatives = np.delete(cost_matrix[:, col], row)
+            track_alternatives = np.delete(cost_matrix[row, :], col)
+            det_margin = (
+                float(np.min(det_alternatives)) - distance
+                if det_alternatives.size > 0 else float("inf")
+            )
+            track_margin = (
+                float(np.min(track_alternatives)) - distance
+                if track_alternatives.size > 0 else float("inf")
+            )
+            if det_margin < margin or track_margin < margin:
+                continue
+
+            track = self.inactive_tracks[row]
+            detection_idx = unmatched_detections[col]
+            track.reactivate(detections[detection_idx])
+            confidence = 1.0 - distance / max(threshold, 1e-12)
+            track.match_confidence = float(np.clip(confidence, 0.0, 1.0))
+            self.tracks.append(track)
+            reactivated_rows.add(row)
+            reactivated_detections.add(detection_idx)
+
+        if reactivated_rows:
+            self.inactive_tracks = [
+                track for idx, track in enumerate(self.inactive_tracks)
+                if idx not in reactivated_rows
+            ]
+        return [
+            detection_idx for detection_idx in unmatched_detections
+            if detection_idx not in reactivated_detections
+        ]
 
     @staticmethod
     def _build_short_history(track, history_len):
@@ -405,6 +550,7 @@ class Tracker:
             A list of detections at the current time step.
 
         """
+        self._prune_inactive_tracks()
         # Run matching cascade.
         matches, unmatched_tracks, unmatched_detections = \
             self._match(detections)
@@ -413,10 +559,17 @@ class Tracker:
         for track_idx, detection_idx in matches:
             self.tracks[track_idx].update(detections[detection_idx])
         for track_idx in unmatched_tracks:
-            self.tracks[track_idx].mark_missed()
+            track = self.tracks[track_idx]
+            was_confirmed = track.is_confirmed()
+            track.mark_missed()
+            if was_confirmed and track.is_deleted():
+                self._archive_track(track)
+        self.tracks = [t for t in self.tracks if not t.is_deleted()]
+        unmatched_detections = self._reactivate_inactive_tracks(
+            detections, unmatched_detections
+        )
         for detection_idx in unmatched_detections:
             self._initiate_track(detections[detection_idx])
-        self.tracks = [t for t in self.tracks if not t.is_deleted()]
 
         # Update distance metric.
         active_targets = [t.track_id for t in self.tracks if t.is_confirmed()]

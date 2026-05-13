@@ -402,6 +402,24 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
             temporal_score_row["gated_cost_matrix"] = gated_cost.tolist()
         tracker.update(detections)
         if temporal_score_row is not None:
+            active_track_ids = [
+                int(track.track_id) for track in tracker.tracks
+                if track.is_confirmed()
+            ]
+            stale_track_ids = [
+                int(track.track_id) for track in tracker.tracks
+                if track.is_confirmed() and track.time_since_update > 1
+            ]
+            inactive_track_ids = [
+                int(track.track_id)
+                for track in getattr(tracker, "inactive_tracks", [])
+            ]
+            temporal_score_row["active_track_ids"] = active_track_ids
+            temporal_score_row["stale_track_ids"] = stale_track_ids
+            temporal_score_row["inactive_track_ids"] = inactive_track_ids
+            temporal_score_row["stored_track_ids"] = sorted(
+                set(active_track_ids) | set(inactive_track_ids)
+            )
             temporal_score_rows.append(temporal_score_row)
 
         # Update visualization.
@@ -501,6 +519,7 @@ def parse_args():
     parser.add_argument("--topk", action="store_true")
     parser.add_argument("--full", action="store_true")
     parser.add_argument("--phase_truncation", action="store_true")
+    parser.add_argument("--inactive_reactivation", action="store_true")
     parser.add_argument("--learned_temporal", action="store_true")
     parser.add_argument("--fuse_learned_temporal", action="store_true")
     parser.add_argument("--temporal_model_ckpt", default=None)
@@ -527,6 +546,7 @@ if __name__ == "__main__":
         "topk",
         "full",
         "phase_truncation",
+        "inactive_reactivation",
     ]:
         if getattr(args, flag):
             opt_argv.append(f"--{flag}")

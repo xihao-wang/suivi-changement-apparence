@@ -153,6 +153,11 @@ class opts:
             action='store_true',
             help='Enable heuristic long-memory truncation after a stable clothes-phase change.'
         )
+        self.parser.add_argument(
+            '--inactive_reactivation',
+            action='store_true',
+            help='Archive deleted confirmed tracks and allow conservative appearance-based reactivation.'
+        )
 
     def parse(self, args=''):
         if args == '':
@@ -175,6 +180,10 @@ class opts:
         opt.ambiguity_distance_threshold = 0.02
         opt.ambiguity_margin = 0.003
         opt.match_conf_margin_scale = 0.02
+        opt.inactive_max_tracks = 100
+        opt.inactive_max_age = 1000000
+        opt.inactive_reactivation_threshold = 0.12
+        opt.inactive_reactivation_margin = 0.04
         opt.phase_old_sim_threshold = 0.45
         opt.phase_short_sim_threshold = 0.75
         opt.phase_consistency_threshold = 0.75
@@ -187,14 +196,17 @@ class opts:
         opt.enable_memory_matching = False
         opt.enable_topk_matching = False
         opt.enable_phase_truncation = False
+        opt.enable_inactive_reactivation = False
 
         opt.enable_stm_ltm = (
             opt.full or opt.ltm_stm or opt.memory_init or opt.memory_aware or opt.topk or opt.phase_truncation
+            or opt.inactive_reactivation
         )
         opt.enable_memory_init_control = opt.full or opt.memory_init
         opt.enable_memory_matching = opt.full or opt.memory_aware or opt.topk
         opt.enable_topk_matching = opt.full or opt.topk
         opt.enable_phase_truncation = opt.full or opt.phase_truncation
+        opt.enable_inactive_reactivation = opt.inactive_reactivation
 
         
         if opt.BoT:
