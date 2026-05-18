@@ -184,6 +184,8 @@ class opts:
         opt.inactive_max_age = 1000000
         opt.inactive_reactivation_threshold = 0.12
         opt.inactive_reactivation_margin = 0.04
+        opt.inactive_reactivation_learned_min_prob = 0.5
+        opt.reactivation_probation_frames = 3
         opt.phase_old_sim_threshold = 0.45
         opt.phase_short_sim_threshold = 0.75
         opt.phase_consistency_threshold = 0.75

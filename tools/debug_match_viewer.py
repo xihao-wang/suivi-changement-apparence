@@ -57,6 +57,7 @@ class FrameReport:
     unmatched_detection_indices: list[int]
     stored_track_ids: list[int]
     stale_track_ids: list[int]
+    probation_track_ids: list[int]
     inactive_track_ids: list[int]
     ambiguous_track_ids: list[int]
     ambiguous_info: dict[int, dict[str, Any]]
@@ -346,6 +347,9 @@ def _build_replay_reports(
         ]
         if "stale_track_ids" in precomputed:
             stale_track_ids = [int(track_id) for track_id in precomputed["stale_track_ids"]]
+        probation_track_ids = []
+        if "probation_track_ids" in precomputed:
+            probation_track_ids = [int(track_id) for track_id in precomputed["probation_track_ids"]]
         if "inactive_track_ids" in precomputed:
             inactive_track_ids = [int(track_id) for track_id in precomputed["inactive_track_ids"]]
 
@@ -407,6 +411,7 @@ def _build_replay_reports(
             unmatched_detection_indices=sorted(unmatched_detection_indices),
             stored_track_ids=stored_track_ids,
             stale_track_ids=stale_track_ids,
+            probation_track_ids=probation_track_ids,
             inactive_track_ids=inactive_track_ids,
             ambiguous_track_ids=[],
             ambiguous_info={},
@@ -505,7 +510,8 @@ def build_reports(
         tracker._prune_inactive_tracks()
 
         confirmed_track_indices = [
-            i for i, t in enumerate(tracker.tracks) if t.is_confirmed()
+            i for i, t in enumerate(tracker.tracks)
+            if t.is_confirmed() and not t.is_in_reactivation_probation()
         ]
         detection_indices = list(range(len(detections)))
         candidate_tracks = [tracker.tracks[i] for i in confirmed_track_indices]
@@ -597,6 +603,10 @@ def build_reports(
             int(track.track_id) for track in tracker.tracks
             if track.is_confirmed() and track.time_since_update > 1
         )
+        probation_track_ids = sorted(
+            int(track.track_id) for track in tracker.tracks
+            if track.is_in_reactivation_probation()
+        )
         inactive_track_ids = sorted(
             int(track.track_id) for track in getattr(tracker, "inactive_tracks", [])
         )
@@ -651,23 +661,33 @@ def build_reports(
             unmatched_detection_indices=list(unmatched_detections),
             stored_track_ids=stored_track_ids,
             stale_track_ids=stale_track_ids,
+            probation_track_ids=probation_track_ids,
             inactive_track_ids=inactive_track_ids,
             ambiguous_track_ids=list(tracker.last_ambiguous_tracks),
             ambiguous_info=dict(tracker.last_ambiguous_info),
         )
         reports.append(report)
 
+        failed_probation_track_ids = set()
         for track_idx, detection_idx in matches:
-            tracker.tracks[track_idx].update(detections[detection_idx])
+            track = tracker.tracks[track_idx]
+            was_probation = track.is_in_reactivation_probation()
+            track.update(detections[detection_idx])
+            if was_probation:
+                track.accept_reactivation_probation_match()
         for track_idx in unmatched_tracks:
             track = tracker.tracks[track_idx]
             was_confirmed = track.is_confirmed()
-            track.mark_missed()
+            if track.is_in_reactivation_probation():
+                failed_probation_track_ids.add(track.track_id)
+                track.fail_reactivation_probation()
+            else:
+                track.mark_missed()
             if was_confirmed and track.is_deleted():
                 tracker._archive_track(track)
         tracker.tracks = [t for t in tracker.tracks if not t.is_deleted()]
         unmatched_detections = tracker._reactivate_inactive_tracks(
-            detections, unmatched_detections
+            detections, unmatched_detections, failed_probation_track_ids
         )
         for detection_idx in unmatched_detections:
             tracker._initiate_track(detections[detection_idx])
@@ -1468,6 +1488,9 @@ class MatchViewerApp:
         )
         self.summary_text.insert(
             tk.END, f"Stale tracks: {report.stale_track_ids or 'none'}\n"
+        )
+        self.summary_text.insert(
+            tk.END, f"Probation tracks: {report.probation_track_ids or 'none'}\n"
         )
         self.summary_text.insert(
             tk.END, f"Inactive tracks: {report.inactive_track_ids or 'none'}\n\n"

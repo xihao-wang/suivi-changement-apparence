@@ -243,7 +243,8 @@ def _compute_debug_matrices(tracker, detections, learned_score_matrix=None):
     from opts import opt
 
     confirmed_track_indices = [
-        idx for idx, track in enumerate(tracker.tracks) if track.is_confirmed()
+        idx for idx, track in enumerate(tracker.tracks)
+        if track.is_confirmed() and not track.is_in_reactivation_probation()
     ]
     detection_indices = list(range(len(detections)))
     candidate_tracks = [tracker.tracks[idx] for idx in confirmed_track_indices]
@@ -373,7 +374,10 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
         tracker.predict()
         temporal_score_row = None
         if temporal_model is not None:
-            candidate_tracks = [track for track in tracker.tracks if track.is_confirmed()]
+            candidate_tracks = [
+                track for track in tracker.tracks
+                if track.is_confirmed() and not track.is_in_reactivation_probation()
+            ]
             score_matrix = _compute_temporal_scores(candidate_tracks, detections, temporal_model)
             temporal_score_row = {
                 "frame": int(frame_idx),
@@ -410,16 +414,22 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
                 int(track.track_id) for track in tracker.tracks
                 if track.is_confirmed() and track.time_since_update > 1
             ]
+            probation_track_ids = [
+                int(track.track_id) for track in tracker.tracks
+                if track.is_in_reactivation_probation()
+            ]
             inactive_track_ids = [
                 int(track.track_id)
                 for track in getattr(tracker, "inactive_tracks", [])
             ]
             temporal_score_row["active_track_ids"] = active_track_ids
             temporal_score_row["stale_track_ids"] = stale_track_ids
+            temporal_score_row["probation_track_ids"] = probation_track_ids
             temporal_score_row["inactive_track_ids"] = inactive_track_ids
             temporal_score_row["stored_track_ids"] = sorted(
                 set(active_track_ids) | set(inactive_track_ids)
             )
+            temporal_score_row["reactivation_info"] = list(tracker.last_reactivation_info)
             temporal_score_rows.append(temporal_score_row)
 
         # Update visualization.

@@ -95,6 +95,7 @@ class Track:
         self.last_phase_reset_hit = -10**9
         self.current_phase_start_hit = 1
         self.match_confidence = None
+        self.reactivation_probation_remaining = 0
         if feature is not None:
             self.det_feat_history.append(feature.copy())
             if opt.enable_stm_ltm:
@@ -330,12 +331,24 @@ class Track:
         elif self.time_since_update > self._max_age:
             self.state = TrackState.Deleted
 
-    def reactivate(self, detection):
+    def reactivate(self, detection, probation_frames=0):
         """Bring an archived confirmed track back with a fresh Kalman state."""
         self.mean, self.covariance = self.kf.initiate(detection.to_xyah())
         self.state = TrackState.Confirmed
         self.time_since_update = 0
         self.update(detection)
+        self.reactivation_probation_remaining = max(0, int(probation_frames))
+
+    def is_in_reactivation_probation(self):
+        return self.reactivation_probation_remaining > 0
+
+    def accept_reactivation_probation_match(self):
+        if self.reactivation_probation_remaining > 0:
+            self.reactivation_probation_remaining -= 1
+
+    def fail_reactivation_probation(self):
+        self.reactivation_probation_remaining = 0
+        self.state = TrackState.Deleted
 
     def is_tentative(self):
         """Returns True if this track is tentative (unconfirmed).
