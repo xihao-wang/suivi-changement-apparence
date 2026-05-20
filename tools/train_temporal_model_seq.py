@@ -175,7 +175,13 @@ def _score_batch(model, det, hist_s, hist_l, slen, llen, dmat):
     return result, None
 
 
-def tbptt_forward(model, pos_det, hist_short, hist_long, hist_slen, hist_llen, neg_det, device):
+def _add_feat_noise(feat: torch.Tensor, std: float) -> torch.Tensor:
+    """Add isotropic Gaussian noise then re-normalise to unit sphere."""
+    return F.normalize(feat + torch.randn_like(feat) * std, dim=-1)
+
+
+def tbptt_forward(model, pos_det, hist_short, hist_long, hist_slen, hist_llen, neg_det, device,
+                  feat_noise_std: float = 0.0):
     """One TBPTT sequence forward pass.
 
     At each step k:
@@ -183,6 +189,10 @@ def tbptt_forward(model, pos_det, hist_short, hist_long, hist_slen, hist_llen, n
       2. Score M negative detections with same DMAT  →  neg_logits
       3. InfoNCE loss: positive must outscore all negatives
       4. TBPTT detach: pass updated_dmat.detach() to step k+1
+
+    feat_noise_std > 0 adds Gaussian noise to the current-frame detection
+    features only (not to history), forcing the model to rely on temporal
+    context rather than raw static similarity.
 
     Returns mean InfoNCE loss over K steps.
     """
@@ -203,13 +213,19 @@ def tbptt_forward(model, pos_det, hist_short, hist_long, hist_slen, hist_llen, n
         llen_k = hist_llen[:, k]                # (B,)
 
         # ── positive ──────────────────────────────────────────────────────
+        pos_k = pos_det[:, k]
+        if feat_noise_std > 0.0:
+            pos_k = _add_feat_noise(pos_k, feat_noise_std)
+
         pos_logit, updated_dmat = _score_batch(
-            model, pos_det[:, k], hs_k, hl_k, slen_k, llen_k, dmat
+            model, pos_k, hs_k, hl_k, slen_k, llen_k, dmat
         )
         # pos_logit: (B,)   updated_dmat: (B, 1, H)
 
         # ── negatives: same track history, M different detections ─────────
         neg_flat  = neg_det[:, k].reshape(B * M, D)
+        if feat_noise_std > 0.0:
+            neg_flat = _add_feat_noise(neg_flat, feat_noise_std)
         hs_rep    = hs_k.unsqueeze(1).expand(-1, M, -1, -1).reshape(B * M, Ls, D)
         hl_rep    = hl_k.unsqueeze(1).expand(-1, M, -1, -1).reshape(B * M, Ll, D)
         slen_rep  = slen_k.unsqueeze(1).expand(-1, M).reshape(B * M)
@@ -325,6 +341,13 @@ def parse_args():
                              "Use to up-weight sequences containing hard appearance changes.")
     parser.add_argument("--oversample_factor", type=int, default=5,
                         help="How many times to repeat oversampled npz files.")
+    # ── Feature-noise augmentation ────────────────────────────────────────
+    parser.add_argument("--feat_noise_std", type=float, default=0.0,
+                        help="Std of isotropic Gaussian noise added to current-frame detection "
+                             "features (pos and neg) at each TBPTT step during training only. "
+                             "Noise is applied before L2 re-normalisation. "
+                             "Forces the model to rely on temporal (DMAT) context rather than "
+                             "raw static similarity. Try 0.05–0.15; 0 = disabled (default).")
     # ─────────────────────────────────────────────────────────────────────
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
@@ -375,9 +398,10 @@ def main():
         names = [Path(p).stem for p in args.oversample_npz]
         oversample_info = f" | oversample x{args.oversample_factor}: {names}"
     neg_info = f"global ({M})" if args.global_neg else f"stored ({M})"
+    noise_info = f" | feat_noise_std={args.feat_noise_std}" if args.feat_noise_std > 0 else ""
     print(
         f"Train: {len(train_set)} sequences | Val: {len(val_set)} sequences | "
-        f"K={K} steps | negatives: {neg_info} | feat_dim={D}{oversample_info}"
+        f"K={K} steps | negatives: {neg_info} | feat_dim={D}{oversample_info}{noise_info}"
     )
 
     # Verify feature dim matches model
@@ -415,6 +439,7 @@ def main():
             loss = tbptt_forward(
                 model, pos_det, hist_short, hist_long,
                 hist_slen, hist_llen, neg_det, args.device,
+                feat_noise_std=args.feat_noise_std,
             )
             loss.backward()
             if args.grad_clip > 0:
@@ -428,19 +453,20 @@ def main():
         val_loss, val_acc   = evaluate_seq(model, val_loader, args.device)
 
         ckpt_out = {
-            "epoch":           epoch,
-            "state_dict":      model.state_dict(),
-            "feature_dim":     ckpt["feature_dim"],
-            "hidden_dim":      ckpt["hidden_dim"],
-            "num_heads":       ckpt.get("num_heads", 4),
-            "history_len":     ckpt["history_len"],
+            "epoch":            epoch,
+            "state_dict":       model.state_dict(),
+            "feature_dim":      ckpt["feature_dim"],
+            "hidden_dim":       ckpt["hidden_dim"],
+            "num_heads":        ckpt.get("num_heads", 4),
+            "history_len":      ckpt["history_len"],
             "long_history_len": ckpt["long_history_len"],
-            "use_long_memory": True,
-            "train_loss":      train_loss,
-            "val_loss":        val_loss,
-            "val_acc":         val_acc,
-            "seq_len":         K,
-            "num_negatives":   M,
+            "use_long_memory":  True,
+            "train_loss":       train_loss,
+            "val_loss":         val_loss,
+            "val_acc":          val_acc,
+            "seq_len":          K,
+            "num_negatives":    M,
+            "feat_noise_std":   args.feat_noise_std,
         }
         torch.save(ckpt_out, save_dir / f"epoch_{epoch:03d}.pt")
 
