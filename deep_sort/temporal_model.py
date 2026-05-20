@@ -136,7 +136,6 @@ class TemporalAttentionScorer(nn.Module):
         self.last_short_similarity = None
         self.last_long_similarity = None
         self.last_long_attention = None
-        self._last_long_context = None
 
     @staticmethod
     def _build_key_padding_mask(lengths, max_len, device):
@@ -270,7 +269,6 @@ class TemporalAttentionScorer(nn.Module):
         long_hist_len=None,
         input_tokens=None,
         return_attention=True,
-        dmat=None,
     ):
         if input_tokens is None:
             input_tokens = self.build_input_tokens(
@@ -281,10 +279,8 @@ class TemporalAttentionScorer(nn.Module):
             )
         _, _, long_tokens = input_tokens
         batch_size = long_tokens.size(0)
-        if dmat is not None:
-            long_query = self.long_query_norm(dmat)
-        else:
-            long_query = self.long_query_norm(self.long_query_token.expand(batch_size, -1, -1))
+        long_query = self.long_query_token.expand(batch_size, -1, -1)
+        long_query = self.long_query_norm(long_query)
         long_kv = self.long_kv_norm(long_tokens)
         long_padding_mask = self._build_key_padding_mask(
             long_hist_len, long_kv.size(1), long_kv.device
@@ -298,10 +294,8 @@ class TemporalAttentionScorer(nn.Module):
             need_weights=return_attention,
             average_attn_weights=False,
         )
-        self._last_long_context = long_context
-        residual = 0.1 * (dmat.squeeze(1) if dmat is not None else self.long_query_token.squeeze(0))
         long_vec = self.long_out_norm(
-            self.long_out(long_context.squeeze(1)) + residual
+            self.long_out(long_context.squeeze(1)) + 0.1 * self.long_query_token.squeeze(0)
         )
         if return_attention:
             return long_vec, long_attn
@@ -352,7 +346,6 @@ class TemporalAttentionScorer(nn.Module):
         short_hist_len=None,
         long_hist_len=None,
         return_attention=True,
-        dmat=None,
     ):
         input_tokens = self.build_input_tokens(
             det_feat,
@@ -380,7 +373,6 @@ class TemporalAttentionScorer(nn.Module):
                     long_hist_len=long_hist_len,
                     input_tokens=input_tokens,
                     return_attention=True,
-                    dmat=dmat,
                 )
             else:
                 long_vec = torch.zeros_like(short_vec)
@@ -402,7 +394,6 @@ class TemporalAttentionScorer(nn.Module):
                     long_hist_len=long_hist_len,
                     input_tokens=input_tokens,
                     return_attention=False,
-                    dmat=dmat,
                 )
             else:
                 long_vec = torch.zeros_like(short_vec)
@@ -454,11 +445,6 @@ class TemporalAttentionScorer(nn.Module):
         self.last_long_similarity = sim_long.detach()
         self.last_long_attention = None if long_attn is None else long_attn.detach()
 
-        if dmat is not None:
-            updated_dmat = self._last_long_context  # (B, 1, hidden_dim)
-            if return_attention:
-                return score, short_attn, updated_dmat
-            return score, updated_dmat
         if return_attention:
             return score, short_attn
         return score

@@ -58,7 +58,6 @@ class Tracker:
         self.last_match_confidences = {}
         self.last_reactivation_info = []
         self.temporal_cost_override = None
-        self._last_dmat_updates = {}
 
     def set_temporal_cost_override(self, track_indices, detection_indices, temporal_cost):
         self.temporal_cost_override = {
@@ -411,20 +410,16 @@ class Tracker:
 
         history_len = getattr(self.temporal_model, "history_len", 5)
         long_history_len = getattr(self.temporal_model, "long_history_len", 30)
-        use_dmat = getattr(self.temporal_model, "use_long_memory", False)
         det_batch = []
         short_batch = []
         long_batch = []
         short_len_batch = []
         long_len_batch = []
-        dmat_batch = []
         pair_indices = []
         temporal_cost = np.ones((len(track_indices), len(detection_indices)), dtype=np.float32)
 
         for row, track_idx in enumerate(track_indices):
             track = tracks[track_idx]
-            if use_dmat and getattr(track, "dmat", None) is None:
-                track.dmat = self.temporal_model.long_query_token.detach().squeeze().cpu().numpy()
             short_result = self._build_short_history(track, history_len)
             if short_result is None:
                 continue
@@ -445,41 +440,24 @@ class Tracker:
                 long_batch.append(long_hist)
                 short_len_batch.append(short_len)
                 long_len_batch.append(long_len)
-                if use_dmat:
-                    dmat_batch.append(track.dmat)
                 pair_indices.append((row, col))
 
         if not pair_indices:
             return temporal_cost
 
         with torch.no_grad():
-            dmat_tensor = (
-                torch.from_numpy(np.stack(dmat_batch, axis=0)).unsqueeze(1)
-                if use_dmat and dmat_batch
-                else None
-            )
-            result = self.temporal_model(
+            logits = self.temporal_model(
                 torch.from_numpy(np.stack(det_batch, axis=0)),
                 torch.from_numpy(np.stack(short_batch, axis=0)),
                 long_hist_feat=torch.from_numpy(np.stack(long_batch, axis=0)),
                 short_hist_len=torch.from_numpy(np.asarray(short_len_batch, dtype=np.int64)),
                 long_hist_len=torch.from_numpy(np.asarray(long_len_batch, dtype=np.int64)),
                 return_attention=False,
-                dmat=dmat_tensor,
             )
-            if dmat_tensor is not None:
-                logits, updated_dmat = result
-            else:
-                logits = result
-                updated_dmat = None
             probs = torch.sigmoid(logits).detach().cpu().numpy()
 
         for idx, (row, col) in enumerate(pair_indices):
             temporal_cost[row, col] = 1.0 - float(probs[idx])
-            if updated_dmat is not None:
-                self._last_dmat_updates[(track_indices[row], detection_indices[col])] = (
-                    updated_dmat[idx, 0, :].detach().cpu().numpy()
-                )
         return temporal_cost
 
     def _fuse_temporal_cost(self, base_cost, temporal_cost):
@@ -697,9 +675,6 @@ class Tracker:
         for track_idx, detection_idx in matches:
             track = self.tracks[track_idx]
             was_probation = track.is_in_reactivation_probation()
-            upd = self._last_dmat_updates.get((track_idx, detection_idx))
-            if upd is not None:
-                track.dmat = upd
             track.update(detections[detection_idx])
             if was_probation:
                 track.accept_reactivation_probation_match()
@@ -735,7 +710,6 @@ class Tracker:
 
     def _match(self, detections):
         self.last_match_confidences = {}
-        self._last_dmat_updates = {}
         for track in self.tracks:
             track.match_confidence = None
         match_costs = {}
