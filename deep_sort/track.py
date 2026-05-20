@@ -95,6 +95,7 @@ class Track:
         self.last_phase_reset_hit = -10**9
         self.current_phase_start_hit = 1
         self.match_confidence = None
+        self.dmat = None  # Dynamic Memory Aggregation Token (DMAT), initialized lazily
         self.reactivation_probation_remaining = 0
         if feature is not None:
             self.det_feat_history.append(feature.copy())
